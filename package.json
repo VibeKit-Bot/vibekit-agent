@@ -1,0 +1,49 @@
+{
+  "name": "vibekit-agent",
+  "version": "1.4.1",
+  "description": "Control your local Claude Code via Telegram",
+  "main": "dist/index.js",
+  "bin": {
+    "vibekit-agent": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js start",
+    "dev": "tsx src/index.ts"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "telegram",
+    "vibekit",
+    "remote"
+  ],
+  "author": "VibeKit",
+  "license": "MIT",
+  "dependencies": {
+    "commander": "^12.1.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.13",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/VibeKit-Bot/vibekit-agent.git"
+  },
+  "homepage": "https://vibekit.bot",
+  "bugs": {
+    "url": "https://github.com/VibeKit-Bot/vibekit-agent/issues"
+  }
+}
