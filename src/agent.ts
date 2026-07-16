@@ -1664,6 +1664,18 @@ export class AgentClient {
    * Handle new conversation command - reset conversation memory
    */
   private handleNewConversation(): void {
+    // Kill any in-flight run FIRST. Otherwise this reset silently undoes
+    // itself: the stream has already re-captured currentSessionId from
+    // system/init, and the close handler re-arms hasActiveConversation on
+    // exit 0 — so the next message would resume the "cleared" conversation.
+    if (this.claudeProcess) {
+      console.log('[Agent] New conversation — stopping in-flight Claude run first');
+      this.claudeWasCanceled = true;
+      this.cancelHeartbeats();
+      this.stopStreaming();
+      try { this.claudeProcess.kill(); } catch { /* already gone */ }
+      this.sendStatus('idle');
+    }
     this.hasActiveConversation = false;
     this.currentSessionId = null;
     console.log('Conversation reset - next message will start fresh');
