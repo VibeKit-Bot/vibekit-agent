@@ -1,6 +1,6 @@
 {
   "name": "vibekit-agent",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "description": "Control your local Claude Code via Telegram",
   "main": "dist/index.js",
   "bin": {
