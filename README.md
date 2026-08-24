@@ -119,7 +119,7 @@ vibekit-agent config --all-tools
 
 ## Links
 
-- [VibeKit Website](https://vibekit.bot)
+- [VibeKit Website](https://vibekit.bot/?ref=github_agent)
 - [Telegram Bot](https://t.me/the_vibe_kit_bot)
 - [GitHub](https://github.com/VibeKit-Bot/vibekit-agent)
 
