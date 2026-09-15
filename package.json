@@ -1,7 +1,7 @@
 {
   "name": "vibekit-agent",
-  "version": "1.4.2",
-  "description": "Control your local Claude Code via Telegram",
+  "version": "1.6.0",
+  "description": "Control your local Claude Code or Codex agent from VibeKit Remote",
   "main": "dist/index.js",
   "bin": {
     "vibekit-agent": "./dist/index.js"
@@ -9,11 +9,14 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js start",
-    "dev": "tsx src/index.ts"
+    "dev": "tsx src/index.ts",
+    "prepublishOnly": "npm run build && cd ../.. && npm run check:agentmcp && npm run check:agentconfig && npm run check:agentgolden && npm run check:agentcodex"
   },
   "keywords": [
     "claude",
     "claude-code",
+    "codex",
+    "openai",
     "telegram",
     "vibekit",
     "remote"

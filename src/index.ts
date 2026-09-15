@@ -5,7 +5,7 @@ import * as readline from 'readline';
 import * as fs from 'fs';
 import * as path from 'path';
 import { AgentClient } from './agent';
-import { Config, DEFAULT_ALLOWED_TOOLS } from './config';
+import { Config, DEFAULT_ALLOWED_TOOLS, ENGINES, Engine, codexToolListProblem } from './config';
 
 const program = new Command();
 
@@ -19,8 +19,38 @@ const CLI_VERSION: string = (() => {
 
 program
   .name('vibekit-agent')
-  .description('Control your local Claude Code via iOS or Telegram')
+  .description('Control Claude Code or Codex on this computer from the VibeKit app')
   .version(CLI_VERSION);
+
+// How often an unlinked supervised agent re-checks for a pairing. Reading one
+// small JSON file, so the interval is about responsiveness, not cost.
+const PAIRING_POLL_MS = 10_000;
+
+/**
+ * "Not linked" is a state only a human can clear, so exiting is the one thing
+ * that must not happen under a supervisor: pm2/systemd read the exit as a crash
+ * and restart forever. That turned a single expired pairing into 869,000 pm2
+ * restarts and 87,380 identical log lines on our own box (2026-08-04) — the
+ * spin produced no progress, only noise, and buried the one line that mattered.
+ *
+ * Interactively the exit is still right: a person who typed `start` wants their
+ * prompt back with a non-zero status. So the TTY check is the fork — a human
+ * gets the error, a supervisor gets an agent that waits and then starts itself
+ * the moment `vibekit-agent link` writes the pairing, with no pm2 command to run.
+ */
+async function waitForPairing(): Promise<Config> {
+  console.error('No token found. Run "vibekit-agent link" first.');
+  if (process.stdout.isTTY) process.exit(1);
+  console.error('Waiting for a pairing — this agent starts on its own once you link it.');
+  for (;;) {
+    await new Promise((resolve) => setTimeout(resolve, PAIRING_POLL_MS));
+    const linked = new Config();
+    if (linked.hasToken()) {
+      console.log('Pairing found. Starting.');
+      return linked;
+    }
+  }
+}
 
 program
   .command('link')
@@ -39,8 +69,19 @@ program
   .option('--ws-url <url>', 'WebSocket URL (auto mode)')
   .option('--token <token>', 'Authentication token (auto mode)')
   .option('--credentials-file <path>', 'Claude credentials file path (auto mode)')
+  .option('--engine <engine>', 'Coding agent to run: claude or codex (remembered for next time)')
   .action(async (options) => {
     let config: Config;
+
+    const engine = options.engine as string | undefined;
+    if (engine !== undefined && !(ENGINES as readonly string[]).includes(engine)) {
+      console.error(`Unknown engine "${engine}". Use: ${ENGINES.join(' or ')}.`);
+      process.exit(1);
+    }
+    if (options.auto && engine === 'codex') {
+      console.error('Auto mode runs Claude Code only.');
+      process.exit(1);
+    }
 
     if (options.auto) {
       // Auto mode: get config from command line args or environment variables
@@ -58,9 +99,10 @@ program
     } else {
       config = new Config();
 
-      if (!config.hasToken()) {
-        console.error('No token found. Run "vibekit-agent link" first.');
-        process.exit(1);
+      if (!config.hasToken()) config = await waitForPairing();
+      if (engine) {
+        const cleared = config.setEngine(engine as Engine);
+        if (cleared) console.log(`Cleared the model setting "${cleared}": it was for the other coding agent.`);
       }
     }
 
@@ -132,6 +174,11 @@ program
 
     if (options.tools) {
       const tools = options.tools.split(',').map((t: string) => t.trim()).filter(Boolean);
+      const problem = config.getEngine() === 'codex' ? codexToolListProblem(tools) : null;
+      if (problem) {
+        console.error(problem);
+        process.exit(1);
+      }
       config.setAllowedTools(tools);
       console.log('Allowed tools set to:', tools.join(', '));
       return;
@@ -142,6 +189,7 @@ program
     console.log('Current configuration:');
     console.log(`  Config file: ${config.configPath}`);
     console.log(`  Linked: ${config.hasToken() ? 'Yes' : 'No'}`);
+    console.log(`  Engine: ${config.getEngine() === 'codex' ? 'Codex' : 'Claude Code'}`);
     if (tools.length === 0) {
       console.log('  Allowed tools: ALL (no restrictions)');
     } else {

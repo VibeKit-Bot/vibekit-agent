@@ -1,10 +1,37 @@
 import WebSocket from 'ws';
-import { spawn, ChildProcess, execSync } from 'child_process';
+import * as http from 'http';
+import { randomUUID } from 'crypto';
+import { spawn, ChildProcess, execSync, execFile } from 'child_process';
+import { StringDecoder } from 'string_decoder';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as dns from 'dns';
-import { Config } from './config';
+import {
+  Config, ConfigChange, describeLoosenings, isValidModel, CONFIG_CHANGE_KEYS,
+  Engine, CodexAccess, codexAccessFor, codexToolListProblem, codexReportedTools,
+} from './config';
+import { CodexEngine, CODEX_TESTED_VERSION, McpServerSpec, VKCONFIG_SERVER, codexLoggedIn, findCodexBinary, isOlderVersion } from './codex-engine';
+import { CODEX_NOT_INSTALLED, CodexTurnEnd, codexErrorReply } from './codex-translate';
+
+/** The phone's answer to anything we blocked on: a tool permission prompt, or
+ *  a config change that would reduce safety. */
+interface PhoneDecision {
+  behavior: 'allow' | 'deny';
+  message?: string;
+}
+
+/**
+ * The self-config tools, by the names claude allowlists them under.
+ *
+ * These are appended to EVERY `--allowedTools` list we build. That is the
+ * anti-lockout property: a user who says "only let yourself read files" would
+ * otherwise also revoke the single mechanism for undoing it from their phone,
+ * and would be stranded until they walked back to the machine. MCP tools are
+ * allowlisted by their own names, so restricting Write or Bash never touches
+ * these two.
+ */
+const CONFIG_TOOL_NAMES = ['mcp__vkconfig__get_config', 'mcp__vkconfig__set_config'];
 
 /** Shape of GET /api/agent/claude-credentials — the user's own Claude creds. */
 interface ServerClaudeCreds {
@@ -133,11 +160,6 @@ function findClaudeBinary(): string | null {
 }
 
 // Strip ANSI escape codes
-function stripAnsi(str: string): string {
-  // eslint-disable-next-line no-control-regex
-  return str.replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '');
-}
-
 interface WSMessage {
   type: string;
   payload?: unknown;
@@ -155,6 +177,17 @@ interface MessageAttachment {
   height?: number;        // Image height
 }
 
+/**
+ * The one run in flight, whichever engine runs it. Busy state, Stop,
+ * supersede, the run timeout, the self-update idle check and shutdown all go
+ * through this, so they behave the same for Claude and Codex.
+ */
+interface ActiveRun {
+  engine: 'claude' | 'codex';
+  /** End the run now. `force` is the run timeout: stop without waiting. */
+  stop(force?: boolean): void;
+}
+
 interface UserMessage {
   type: 'message';
   payload: {
@@ -163,13 +196,22 @@ interface UserMessage {
     text: string;
     messageId: number;
     attachments?: MessageAttachment[];
+    // Supervised mode: run claude WITHOUT --dangerously-skip-permissions and
+    // forward each permission prompt to the phone. Absent = off.
+    supervised?: boolean;
   };
 }
 
 export class AgentClient {
   private config: Config;
   private ws: WebSocket | null = null;
-  private claudeProcess: ChildProcess | null = null;
+  private activeRun: ActiveRun | null = null;
+  /** Which coding agent this machine runs. Decided at `link`; see start(). */
+  private engine: Engine = 'claude';
+  /** The Codex app-server driver, created on the first Codex message and kept for the process. */
+  private codex: CodexEngine | null = null;
+  /** The Codex CLI that runs here; looked up again on each message while missing. */
+  private codexBinary: { path: string; version: string } | null = null;
   private caffeinateProcess: ChildProcess | null = null;
   private reconnectTimeout: NodeJS.Timeout | null = null;
   private reconnectDelay = 1000;
@@ -177,9 +219,35 @@ export class AgentClient {
   private currentChatId: number | null = null;
   private currentTelegramId: number | null = null;
   private currentReplyToMessageId: number | null = null;
-  private outputBuffer = '';
+  // True in ephemeral Docker/auto-mode containers — auto-update is skipped
+  // there (each container gets a fresh install, and a mid-build restart would
+  // kill the running task).
+  private autoMode = false;
+
+  // ── Supervised mode (phone approvals) ──
+  // Whether the CURRENT message asked for supervision (rides on each
+  // UserMessage; the toggle lives server-side on the remote_agents row).
+  private currentSupervised = false;
+  // Localhost HTTP server our MCP children call back into: /approve for
+  // supervised-mode permission prompts, /config for self-configuration.
+  // Started lazily on the first run that attaches an MCP server, kept for
+  // the process lifetime.
+  private controlServer: http.Server | null = null;
+  private controlPort = 0;
+  // requestId -> the waiting caller's resolver + its deadline timer. Shared
+  // by both callers of askPhone (a tool permission prompt, and a config
+  // change that would reduce safety).
+  private pendingApprovals: Map<string, { resolve: (d: PhoneDecision) => void; timer: NodeJS.Timeout }> = new Map();
+  // mcp-config written next to the OS tmpdir once per process.
+  private mcpConfigPath: string | null = null;
+  /** How long the phone gets before the agent denies locally. Well inside
+   *  the server's 5-minute per-run SSE ceiling, so a silent phone degrades
+   *  into a readable deny instead of a dead turn. */
+  private static readonly APPROVAL_TIMEOUT_MS = 180_000;
+  // Set once we've kicked off an auto-update this process, so a flurry of
+  // reconnects (each delivering auth_success) can't launch npm repeatedly.
+  private updateAttempted = false;
   private streamingInterval: NodeJS.Timeout | null = null;
-  private lastFlushedLength = 0;
   private currentMessageId: number | null = null;
   private workingDirectory: string = process.cwd();
 
@@ -271,13 +339,13 @@ export class AgentClient {
   // resume failed, instead of looping forever on the same dead id.
   private resumedSessionThisRun = false;
 
-  // Hard kill timer for a wedged Claude run. Mirrors the server's 5-min SSE
+  // Hard kill timer for a wedged run. Mirrors the server's 5-min SSE
   // ceiling at src/routes/remote-app.ts so client + server agree on "this
-  // run is dead". Without this the agent's claudeProcess can sit forever on
+  // run is dead". Without this the active run can sit forever on
   // an infinite bash loop / stuck API call, blocking every subsequent
   // message and leaving the user staring at a spinner.
-  private claudeRunTimeout: NodeJS.Timeout | null = null;
-  private static readonly CLAUDE_RUN_TIMEOUT_MS = 5 * 60_000;
+  private runTimeout: NodeJS.Timeout | null = null;
+  private static readonly RUN_TIMEOUT_MS = 5 * 60_000;
 
   // Set when handleUserMessage acknowledged the cancellation of a previous
   // in-flight run before overwriting currentChatId. Stops the killed run's
@@ -285,7 +353,10 @@ export class AgentClient {
   // (currentChatId has already moved on to the new message). Without this
   // flag, the new message's chat would receive a confusing "Agent exited
   // without a response (code -15)" before its real reply.
-  private claudeWasCanceled = false;
+  /// Runs stopped on purpose (supersede / Stop / run-timeout). Keyed by
+  /// the run itself so a slow-dying old run can never consume a flag
+  /// meant for the new one — the old shared boolean did exactly that.
+  private canceledRuns = new WeakSet<ActiveRun>();
 
   // After a network change (Wi-Fi flap, sleep/wake), macOS's DNS resolver can
   // take 60-90s to come back. Without this flag we burn 1+2+4+8+16=31s on
@@ -367,15 +438,31 @@ export class AgentClient {
       }
       rl.close();
 
+      const wasLinked = this.config.hasToken();
       this.config.setCredentials(result.token, result.wsUrl);
+
+      // The engine is decided HERE, not at `start`. By the time `start` runs
+      // every machine has a token, so it cannot tell a new link from a machine
+      // linked before Codex support, which must stay on Claude (start() pins
+      // those). A re-link keeps whatever engine was already chosen, and a
+      // re-link of a machine linked before Codex support stays on Claude.
+      const engine: Engine = this.config.getEngine()
+        ?? (wasLinked ? 'claude' : findClaudeBinary() ? 'claude' : findCodexBinary(() => {}) ? 'codex' : 'claude');
+      this.config.setEngine(engine);
 
       console.log('\nLinked successfully!');
       console.log('');
-      console.log('Tip: connect Claude in the VibeKit app (Profile → Connect Claude)');
-      console.log('and the agent signs Claude in automatically — no setup-token needed.');
+      if (engine === 'codex') {
+        console.log('This computer will run Codex (Claude Code was not found here).');
+        console.log('Make sure Codex is logged in on this computer: codex login');
+      } else {
+        console.log('Tip: connect Claude in the VibeKit app (Profile → Connect Claude)');
+        console.log('and the agent signs Claude in automatically — no setup-token needed.');
+      }
       console.log('');
       console.log('Start the agent with:');
       console.log('  npx vibekit-agent start');
+      console.log('To switch coding agents later: npx vibekit-agent start --engine claude (or codex)');
       console.log('');
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -388,6 +475,7 @@ export class AgentClient {
    * Start the agent and connect to VibeKit
    */
   async start(directory: string, autoMode: boolean = false): Promise<void> {
+    this.autoMode = autoMode;
     this.workingDirectory = path.resolve(directory);
 
     // Don't persist directory in auto mode (ephemeral container)
@@ -395,26 +483,55 @@ export class AgentClient {
       this.config.setLastDirectory(this.workingDirectory);
     }
 
+    // No stored engine means this machine was linked before Codex support, so
+    // it runs Claude, and is pinned to it now. Detecting here instead would
+    // silently switch a user who relies on the npx Claude download and happens
+    // to have Codex installed. Auto mode (Docker) is Claude-only and never
+    // writes the config file.
+    if (!autoMode && !this.config.getEngine()) this.config.setEngine('claude');
+    this.engine = autoMode ? 'claude' : (this.config.getEngine() ?? 'claude');
+
     console.log(`Starting VibeKit Remote Agent...`);
     console.log(`Working directory: ${this.workingDirectory}`);
+    console.log(`Engine: ${this.engine === 'codex' ? 'Codex' : 'Claude Code'}`);
 
     // In auto mode, set up Claude credentials from the credentials file.
     // Otherwise, sign Claude in from the user's VibeKit account if they've
     // connected it there — so they don't need a separate `claude setup-token`.
     if (autoMode) {
       await this.setupAutoModeCredentials();
-    } else {
+    } else if (this.engine === 'claude') {
       await this.ensureAccountClaudeAuth();
     }
 
-    // Check for claude binary at startup
-    const claudePath = findClaudeBinary();
-    if (claudePath) {
-      console.log(`Claude Code found: ${claudePath}`);
+    if (this.engine === 'codex') {
+      // A candidate only counts if `codex --version` runs, so a broken install
+      // reads as not installed instead of failing every message.
+      this.codexBinary = findCodexBinary();
+      if (this.codexBinary) {
+        console.log(`Codex found: ${this.codexBinary.path} (v${this.codexBinary.version})`);
+        if (isOlderVersion(this.codexBinary.version, CODEX_TESTED_VERSION)) {
+          console.log(`This Codex is older than v${CODEX_TESTED_VERSION}, the version VibeKit Remote was tested with. If messages fail, run: npm i -g @openai/codex@latest`);
+        }
+        // Said here so a user at the terminal can fix it before the first
+        // message. The engine re-checks on each message, so logging in later
+        // needs no restart.
+        if (codexLoggedIn(this.codexBinary.path) === false) {
+          console.log('Codex is not logged in on this computer. Run `codex login`; messages work as soon as you do.');
+        }
+      } else {
+        console.log('\nCodex not found. Install it with `npm i -g @openai/codex`, then run `codex login`.');
+      }
     } else {
-      console.log('\nClaude Code not found locally — will auto-run via `npx @anthropic-ai/claude-code` on first message.');
-      console.log('(First invocation downloads ~50MB and takes ~30s; cached thereafter.)');
-      console.log('For a faster first message, install ahead of time: `claude install` or `npm install -g @anthropic-ai/claude-code`.\n');
+      // Check for claude binary at startup
+      const claudePath = findClaudeBinary();
+      if (claudePath) {
+        console.log(`Claude Code found: ${claudePath}`);
+      } else {
+        console.log('\nClaude Code not found locally — will auto-run via `npx @anthropic-ai/claude-code` on first message.');
+        console.log('(First invocation downloads ~50MB and takes ~30s; cached thereafter.)');
+        console.log('For a faster first message, install ahead of time: `claude install` or `npm install -g @anthropic-ai/claude-code`.\n');
+      }
     }
     console.log('');
 
@@ -424,6 +541,11 @@ export class AgentClient {
     // "agent offline" until the laptop wakes. Lid-close sleep is still
     // unstoppable from userspace — this only blocks idle sleep.
     this.startCaffeinate();
+
+    // Our MCP children call back on this port, and runClaude() bakes it into
+    // the argv synchronously — so it has to be bound before the first message
+    // can arrive, not on demand.
+    await this.ensureControlServer();
 
     // Connect to VibeKit WebSocket
     this.connect();
@@ -443,20 +565,7 @@ export class AgentClient {
     // Find the claude binary
     const claudeBinary = findClaudeBinary();
 
-    // Kill any existing process. If one is in flight, handleUserMessage already
-    // sent a "canceled" reply to its chatId — the suppression flag below stops
-    // the close handler from re-sending a misattributed fallback to the new
-    // chat.
-    if (this.claudeProcess) {
-      this.claudeWasCanceled = true;
-      this.claudeProcess.kill();
-    }
-
-    // Clear streaming state
-    this.stopStreaming();
-    this.outputBuffer = '';
-    this.lastFlushedLength = 0;
-    this.currentMessageId = null;
+    this.supersedeActiveRun();
 
     // Build command arguments
     const allowedTools = this.config.getAllowedTools();
@@ -494,13 +603,74 @@ export class AgentClient {
     // exceeds it can be split across messages.
     args.push('--max-turns', '50');
 
-    if (allowedTools.length === 0) {
+    // MCP plumbing. The SELF-CONFIG server is attached on every run, not just
+    // supervised ones: "change your own settings" has to work in the default
+    // posture, which is where nearly every user actually lives. Supervised
+    // mode additionally attaches the permission-prompt server.
+    let mcpConfigPath: string | null = null;
+    let supervisedArmed = false;
+    if (this.currentSupervised) {
+      try {
+        mcpConfigPath = this.ensureMcpPlumbing(true);
+        supervisedArmed = true;
+      } catch (e: any) {
+        // Fail CLOSED into the old restricted behavior rather than silently
+        // granting everything the user asked us to gate.
+        console.error(`[Supervised] Could not start approval plumbing (${e?.message || e}) — running with tool restrictions instead.`);
+      }
+    } else {
+      // A missing or broken config-mcp.js must never take down an ordinary
+      // run, so this degrades to "no self-config this turn" rather than throw.
+      // It SAYS so, though: swallowing the reason is what let a bind that
+      // failed on every run look like a feature nobody had asked for.
+      try {
+        mcpConfigPath = this.ensureMcpPlumbing(false);
+      } catch (e: any) {
+        console.error(`[Self-config] Not attached this run (${e?.message || e}).`);
+        mcpConfigPath = null;
+      }
+    }
+    if (mcpConfigPath) args.push('--mcp-config', mcpConfigPath);
+
+    /** An --allowedTools value that always keeps the self-config tools on it.
+     *  See CONFIG_TOOL_NAMES for why this is not optional. */
+    const allowList = (tools: string[]): string =>
+      [...tools, ...(mcpConfigPath ? CONFIG_TOOL_NAMES : [])].join(',');
+
+    if (supervisedArmed) {
+      // Supervised mode: no skip-permissions. Every prompt claude would have
+      // shown in a terminal routes through our MCP permission tool → parent
+      // HTTP callback → WebSocket → the user's phone, which answers with
+      // allow/deny (auto-deny after APPROVAL_TIMEOUT_MS). An explicit
+      // allowedTools list still pre-approves those tools; everything else
+      // gets prompted instead of refused.
+      //
+      // The flag is passed ONLY when the user already had a list, exactly as
+      // before. Adding one where there was none would put this live safety
+      // path into a state it has never run in, on an assumption about
+      // claude-cli's precedence that is not worth testing in production. The
+      // cost of not doing it is one extra tap to change a setting while
+      // supervised, which is what "ask before actions" means anyway, and the
+      // anti-lockout property still holds: an unlisted config tool prompts,
+      // and the user can approve it.
+      args.push('--permission-prompt-tool', 'mcp__vkapprove__approve');
+      if (allowedTools.length > 0) args.push('--allowedTools', allowList(allowedTools));
+      console.log('[Supervised] Permission prompts will be sent to your phone.');
+    } else if (this.currentSupervised) {
+      // Arming failed above — restricted fallback.
+      args.push('--allowedTools', allowList(allowedTools.length > 0 ? allowedTools : ['Read', 'Grep', 'Glob', 'LS']));
+    } else if (allowedTools.length === 0) {
       // No restrictions - allow everything
       args.push('--dangerously-skip-permissions');
     } else {
       // Use specific allowed tools
-      args.push('--allowedTools', allowedTools.join(','));
+      args.push('--allowedTools', allowList(allowedTools));
     }
+
+    // Model override. Unset (the default, and the only behaviour before this
+    // key existed) leaves the choice to the user's claude install.
+    const model = this.config.getModel();
+    if (model) args.push('--model', model);
 
     // Decide how to launch claude:
     //   - local binary (installed) → spawn it directly (fast)
@@ -529,148 +699,112 @@ export class AgentClient {
     const redacted = spawnArgs.map((a, i, arr) => (arr[i - 1] === '-p' ? '"..."' : a)).join(' ');
     console.log(`\nRunning: ${command} ${redacted}`);
 
-    this.claudeProcess = spawn(command, spawnArgs, {
+    // Every handler below closes over `run` and gates on
+    // `this.activeRun === run`. A killed process's buffered stdout (and
+    // its close event) fire AFTER the next run has been assigned — without
+    // the gates, the old run's tail text leaked into the new run's buffer and
+    // the old close handler nulled the NEW run, which disarmed Stop,
+    // the 5-min kill timer, and the idle check that gates self-update.
+    const proc = spawn(command, spawnArgs, {
       cwd: this.workingDirectory,
       env: process.env,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
+    const run: ActiveRun = {
+      engine: 'claude',
+      stop: (force) => { try { proc.kill(force ? 'SIGKILL' : 'SIGTERM'); } catch { /* already gone */ } },
+    };
+    this.beginRun(run);
 
-    // Hard 5-min kill timer. Mirrors the server's SSE inactivity ceiling so
-    // a wedged Claude (infinite bash loop, stuck API call, --continue session
-    // corruption) doesn't block every subsequent message indefinitely. Power
-    // users on multi-hour bash can disable with VIBEKIT_AGENT_NO_TIMEOUT=1.
-    if (this.claudeRunTimeout) clearTimeout(this.claudeRunTimeout);
-    if (!process.env.VIBEKIT_AGENT_NO_TIMEOUT) {
-      const proc = this.claudeProcess;
-      const chatIdAtStart = this.currentChatId;
-      this.claudeRunTimeout = setTimeout(() => {
-        // Only act if THIS process is still the current one — a new message
-        // may have replaced it, in which case the cancellation handler runs.
-        if (this.claudeProcess !== proc) return;
-        console.log(`[Agent] Claude run exceeded ${AgentClient.CLAUDE_RUN_TIMEOUT_MS / 1000}s — killing`);
-        if (chatIdAtStart) {
-          this.sendResponse(
-            chatIdAtStart,
-            "_Run exceeded 5 minutes and was stopped. Try a smaller task or split it up._",
-            'complete'
-          );
-        }
-        // Mark canceled so the close handler doesn't double-send.
-        this.claudeWasCanceled = true;
-        try { proc.kill('SIGKILL'); } catch {}
-      }, AgentClient.CLAUDE_RUN_TIMEOUT_MS);
-    }
+    // Per-run UTF-8 decoder: a multibyte character (emoji, CJK, curly quote)
+    // split across two stdout chunks decodes to U+FFFD with a plain
+    // data.toString() — the corruption lands inside the JSON string, parses
+    // fine, and "�" flows into the reply. StringDecoder buffers the partial
+    // sequence across chunks.
+    const stdoutDecoder = new StringDecoder('utf8');
 
-    // Track the final result text from stream-json
-    this.streamJsonResult = '';
-    this.lastRunResultError = '';
-    this.lastRunStderr = '';
-    this.receivedPartialDeltas = false;
-    this.streamJsonLineBuffer = '';
-    this.lastStreamedLength = 0;
-    this.activeToolCalls.clear();
-    this.toolUseCountThisRun = 0;
-    // Heartbeat statuses fire if Claude is slow to produce anything visible.
-    // Real activity (tool/delta) cancels them in their handlers below.
-    this.scheduleHeartbeats();
-
-    this.claudeProcess.stdout?.on('data', (data: Buffer) => {
-      const text = data.toString();
+    proc.stdout?.on('data', (data: Buffer) => {
+      if (this.activeRun !== run) return; // superseded — not our buffer anymore
+      const text = stdoutDecoder.write(data);
       // stream-json outputs one JSON object per line
       this.streamJsonLineBuffer += text;
-      
+
       // Process complete lines
       const lines = this.streamJsonLineBuffer.split('\n');
       this.streamJsonLineBuffer = lines.pop() || ''; // Keep incomplete line in buffer
-      
+
       for (const line of lines) {
         if (!line.trim()) continue;
         this.processStreamJsonLine(line.trim());
       }
     });
 
-    this.claudeProcess.stderr?.on('data', (data: Buffer) => {
+    proc.stderr?.on('data', (data: Buffer) => {
       const text = data.toString();
       process.stderr.write(text);
+      if (this.activeRun !== run) return;
       // Keep the tail so the close handler can classify auth failures.
       this.lastRunStderr = (this.lastRunStderr + text).slice(-8192);
     });
 
-    this.claudeProcess.on('close', (code) => {
+    proc.on('close', (code) => {
+      const settled = this.settleRun(run);
       console.log(`\nClaude exited with code ${code}`);
-
-      // Always clear the run-timeout timer so it doesn't leak past process exit.
-      if (this.claudeRunTimeout) {
-        clearTimeout(this.claudeRunTimeout);
-        this.claudeRunTimeout = null;
-      }
-      // Run finished — kill any pending heartbeats so they don't fire post-exit.
-      this.cancelHeartbeats();
-
-      // If this run was killed because a new message arrived, the cancellation
-      // was already acknowledged in handleUserMessage to the OLD chatId.
-      // Don't re-emit an "exited without response" to the NEW chatId — that
-      // would prepend a confusing failure to the new message's reply.
-      if (this.claudeWasCanceled) {
-        this.claudeWasCanceled = false;
-        this.claudeProcess = null;
-        return;
-      }
+      if (!settled) return;
 
       // Process any remaining buffered line
+      const tail = stdoutDecoder.end();
+      if (tail) this.streamJsonLineBuffer += tail;
       if (this.streamJsonLineBuffer.trim()) {
         this.processStreamJsonLine(this.streamJsonLineBuffer.trim());
       }
 
       this.stopStreaming();
+      // Cancel any pending debounced streaming frame NOW that the remaining
+      // line has been processed — otherwise it fires up to 80ms after the
+      // complete message below and repaints the closed streaming bubble.
+      this.clearStreamingFlush();
 
-      // Send final result
+      // Send final result. Error classification runs INDEPENDENTLY of whether
+      // narration streamed first — a run that talked for a while and THEN died
+      // on auth/an error used to be presented as a successful reply, skipping
+      // the error message and the credential re-sync entirely.
       if (this.currentChatId && this.currentTelegramId) {
         let finalText = this.streamJsonResult.trim();
-        // When Claude errors, the SAME raw error string arrives twice: as the
-        // is_error `result` (stashed in lastRunResultError, never forwarded)
-        // AND as a plain assistant text block, which flows into
-        // streamJsonResult via the streaming path. If the "reply" is just that
-        // echoed error (e.g. "Invalid API key · Please run /login"), blank it
-        // so the classifier below translates it instead of forwarding it raw.
-        if (finalText && this.lastRunResultError && finalText === this.lastRunResultError.trim()) {
-          finalText = '';
+        const errText = this.lastRunResultError.trim();
+        // The raw error string arrives twice: as the is_error `result`
+        // (stashed, never forwarded) AND often as a plain text block that
+        // flowed into the buffer — alone, or appended after real narration.
+        // Strip the echo wherever it sits so it's never presented as a reply.
+        if (finalText && errText && finalText.endsWith(errText)) {
+          finalText = finalText.slice(0, finalText.length - errText.length).trim();
         }
-        if (finalText) {
+        const toolCount = this.toolUseCountThisRun;
+        if (this.looksLikeClaudeAuthFailure()) {
+          // Auth problems are handled explicitly (message + creds re-sync)
+          // even when narration streamed first. Send the narration as its own
+          // bubble so watched work isn't lost, then the auth message.
+          if (finalText) this.sendResponse(this.currentChatId, finalText, 'complete');
+          void this.handleClaudeAuthFailure(this.currentChatId);
+        } else if (errText) {
+          // Real error — surface it, keeping any narration above it instead
+          // of pretending the half-finished narration was the answer.
+          const errLine = `Claude reported an error: ${errText.slice(0, 300)}`;
+          const text = finalText ? `${finalText}\n\n_${errLine}_` : errLine;
+          console.log(`[Agent] Run ended with error result (narration=${finalText.length} chars)`);
+          this.sendResponse(this.currentChatId, text, 'complete');
+        } else if (finalText) {
           console.log(`[Agent] Sending final response (${finalText.length} chars)`);
           this.sendResponse(this.currentChatId, finalText, 'complete');
         } else {
           // Claude exited without producing text. Don't claim success — be honest
           // so the user doesn't think we completed something we didn't.
-          const toolCount = this.toolUseCountThisRun;
-          let fallback: string | null;
-          if (this.looksLikeClaudeAuthFailure()) {
-            // Don't bury an auth problem under a generic exit message — handle
-            // it explicitly (and try to re-sync the account's Claude creds, in
-            // case the user just connected Claude in the app). Suppress the
-            // generic fallback so we don't double-send. Not gated on exit code:
-            // an auth failure can arrive as an is_error result with code 0.
-            void this.handleClaudeAuthFailure(this.currentChatId);
-            fallback = null;
-          } else if (this.lastRunResultError) {
-            // Claude returned a non-auth error as its result — surface it
-            // (trimmed) instead of a generic "no response".
-            fallback = `Claude reported an error: ${this.lastRunResultError.trim().slice(0, 300)}`;
-          } else if (code !== 0) {
-            fallback = `Agent exited without a response (code ${code}). Please try again.`;
-          } else if (toolCount > 0) {
-            fallback = `Agent finished after ${toolCount} tool call${toolCount === 1 ? '' : 's'} but didn't write a reply. Expand the tool calls above to see what was done, or send another message to continue.`;
-          } else {
-            fallback = `Agent finished without producing a response. Try rephrasing or resending.`;
-          }
-          if (fallback) {
-            console.log(`[Agent] No result text collected, sending honest fallback (code=${code}, tools=${toolCount})`);
-            this.sendResponse(this.currentChatId, fallback, 'complete');
-          }
+          console.log(`[Agent] No result text collected, sending honest fallback (code=${code}, tools=${toolCount})`);
+          this.sendResponse(this.currentChatId, this.noReplyFallback(code, toolCount), 'complete');
         }
       }
 
-      this.claudeProcess = null;
+      this.activeRun = null;
 
       // Mark that we now have an active conversation for --continue on next message
       if (code === 0) {
@@ -691,14 +825,16 @@ export class AgentClient {
       this.resumedSessionThisRun = false;
     });
 
-    this.claudeProcess.on('error', (err) => {
+    proc.on('error', (err) => {
       console.error('Failed to start claude:', err.message);
-      if (this.claudeRunTimeout) {
-        clearTimeout(this.claudeRunTimeout);
-        this.claudeRunTimeout = null;
+      if (this.activeRun !== run) return;
+      if (this.runTimeout) {
+        clearTimeout(this.runTimeout);
+        this.runTimeout = null;
       }
       this.cancelHeartbeats();
       this.stopStreaming();
+      this.clearStreamingFlush();
       if (this.currentChatId && this.currentTelegramId) {
         this.sendResponse(
           this.currentChatId,
@@ -706,7 +842,122 @@ export class AgentClient {
           'complete'
         );
       }
+      // This run is over and has replied. Node may or may not emit 'close'
+      // after a spawn 'error': marking it canceled stops a close from sending
+      // a second, fallback reply, and releasing it here stops a missing close
+      // from blocking every later message.
+      this.canceledRuns.add(run);
+      this.activeRun = null;
     });
+  }
+
+  /**
+   * Stop whatever run is in flight because a new message is starting one.
+   * handleUserMessage already sent a "canceled" reply to the old chat, and
+   * marking the run canceled stops its end handler from sending a
+   * misattributed fallback to the new chat.
+   */
+  private supersedeActiveRun(): void {
+    if (this.activeRun) {
+      this.canceledRuns.add(this.activeRun);
+      this.activeRun.stop();
+      this.denyAllPendingApprovals('Superseded by a new message.');
+    }
+    this.stopStreaming();
+    this.clearStreamingFlush();
+    this.currentMessageId = null;
+  }
+
+  /**
+   * Bookkeeping every run shares, whichever engine runs it: it becomes the
+   * active run, gets the hard kill timer, starts from clean per-run state and
+   * gets the heartbeat statuses.
+   */
+  private beginRun(run: ActiveRun): void {
+    this.activeRun = run;
+
+    // Hard 5-min kill timer. Mirrors the server's SSE inactivity ceiling so
+    // a wedged run (infinite bash loop, stuck API call, --continue session
+    // corruption) doesn't block every subsequent message indefinitely. Power
+    // users on multi-hour bash can disable with VIBEKIT_AGENT_NO_TIMEOUT=1.
+    if (this.runTimeout) clearTimeout(this.runTimeout);
+    if (!process.env.VIBEKIT_AGENT_NO_TIMEOUT) {
+      const chatIdAtStart = this.currentChatId;
+      this.runTimeout = setTimeout(() => {
+        // Only act if THIS run is still the current one. A new message
+        // may have replaced it, in which case the cancellation handler runs.
+        if (this.activeRun !== run) return;
+        console.log(`[Agent] ${run.engine} run exceeded ${AgentClient.RUN_TIMEOUT_MS / 1000}s, stopping`);
+        if (chatIdAtStart) {
+          this.sendResponse(
+            chatIdAtStart,
+            "_Run exceeded 5 minutes and was stopped. Try a smaller task or split it up._",
+            'complete'
+          );
+        }
+        // Mark canceled so the end handler doesn't double-send.
+        this.canceledRuns.add(run);
+        run.stop(true);
+      }, AgentClient.RUN_TIMEOUT_MS);
+    }
+
+    // Per-run state. The names come from the Claude stream-json parser, but
+    // the streaming flush and the no-reply fallback read them for every engine.
+    this.streamJsonResult = '';
+    this.lastRunResultError = '';
+    this.lastRunStderr = '';
+    this.receivedPartialDeltas = false;
+    this.streamJsonLineBuffer = '';
+    this.lastStreamedLength = 0;
+    this.activeToolCalls.clear();
+    this.toolUseCountThisRun = 0;
+    // Heartbeat statuses fire if the engine is slow to produce anything
+    // visible. Real activity (tool/delta) cancels them.
+    this.scheduleHeartbeats();
+  }
+
+  /**
+   * The shared start of a run's end. Returns false when there is nothing left
+   * to send: the run was stopped on purpose (Stop, supersede, timeout), whose
+   * stopper already messaged the chat, or it is no longer the active run.
+   */
+  private settleRun(run: ActiveRun): boolean {
+    const isCurrent = this.activeRun === run;
+    const wasCanceled = this.canceledRuns.has(run);
+    this.canceledRuns.delete(run);
+
+    // Timers and pending approvals belong to the CURRENT run — a superseded
+    // run's slow exit must not clear the timers beginRun just armed for its
+    // replacement, or deny the replacement's approval cards. The superseded
+    // run's own approvals were denied when it was stopped.
+    if (isCurrent) {
+      this.denyAllPendingApprovals('The run ended before this was answered.');
+      if (this.runTimeout) {
+        clearTimeout(this.runTimeout);
+        this.runTimeout = null;
+      }
+      this.cancelHeartbeats();
+    }
+
+    // Stopped on purpose: the stop site already messaged the chat.
+    // Superseded-but-not-flagged: also nothing to do, the new run owns all
+    // shared state.
+    if (wasCanceled || !isCurrent) {
+      if (isCurrent) this.activeRun = null;
+      return false;
+    }
+    return true;
+  }
+
+  /** The honest reply for a run that produced no text, so it never reads as a success. */
+  private noReplyFallback(exitCode: number | null, toolCount: number): string {
+    if (exitCode !== 0) {
+      return `Agent exited without a response (code ${exitCode}). Please try again.`;
+    }
+    if (toolCount > 0) {
+      return `Agent finished after ${toolCount} tool call${toolCount === 1 ? '' : 's'} but didn't write a reply. Expand the tool calls above to see what was done, or send another message to continue.`;
+    }
+    return `Agent finished without producing a response. Try rephrasing or resending.`;
   }
 
   /**
@@ -732,6 +983,7 @@ export class AgentClient {
             for (const block of content) {
               if (block.type === 'text' && block.text) {
                 if (!this.receivedPartialDeltas) {
+                  this.ensureBlockSeparator();
                   this.streamJsonResult += block.text;
                   appendedAny = true;
                 }
@@ -746,6 +998,7 @@ export class AgentClient {
             }
           } else if (msg?.type === 'text' && msg.text) {
             if (!this.receivedPartialDeltas) {
+              this.ensureBlockSeparator();
               this.streamJsonResult += msg.text;
               appendedAny = true;
             }
@@ -817,8 +1070,24 @@ export class AgentClient {
               // it as a real reply.
               this.lastRunResultError = event.result;
             } else {
-              // Result might be the final text or a summary
-              this.streamJsonResult = event.result;
+              // `result` carries ONLY the last assistant message (verified
+              // against the CLI: a run that said "Alpha done.", called a tool,
+              // then said "Beta done." has result = just the second message).
+              // When the run streamed multiple text blocks, the accumulated
+              // buffer is a superset ending in `result` — keep it, otherwise
+              // the narration the user just watched vanishes from the
+              // persisted reply. Replace only when the buffer doesn't already
+              // end with the result (single-block runs, stale/empty buffer).
+              // Whitespace-insensitive suffix compare: the buffer joins
+              // blocks with our own "\n\n" while `result` joins them however
+              // the CLI does — an exact endsWith would miss and drop the
+              // watched narration over a newline difference.
+              const norm = (s: string) => s.replace(/\s+/g, ' ').trim();
+              const acc = norm(this.streamJsonResult);
+              const res = norm(String(event.result));
+              if (!(acc && res && acc.endsWith(res))) {
+                this.streamJsonResult = event.result;
+              }
               this.scheduleStreamingFlush();
             }
           }
@@ -865,6 +1134,11 @@ export class AgentClient {
           // can be ignored since the final `assistant` / `result` events
           // still carry the full state.
           const inner = event.event;
+          // A NEW text block is starting — separate it from whatever text the
+          // previous block left in the buffer before its deltas arrive.
+          if (inner?.type === 'content_block_start' && inner.content_block?.type === 'text') {
+            this.ensureBlockSeparator();
+          }
           if (inner?.type === 'content_block_delta' && inner.delta?.type === 'text_delta') {
             const chunk = typeof inner.delta.text === 'string' ? inner.delta.text : '';
             if (chunk) {
@@ -891,16 +1165,17 @@ export class AgentClient {
   }
 
   /**
-   * Start streaming interval to send partial output
+   * Claude emits SEPARATE text blocks per run (narration → tool calls → more
+   * narration, each its own content block / assistant message). Appending them
+   * with a bare += glues the new block's first word straight onto the previous
+   * block's final period ("…done.Now I'll…"), which is how every multi-block
+   * reply rendered on iOS/web. Insert a paragraph break between blocks; no-op
+   * when the buffer is empty or already ends in whitespace.
    */
-  private startStreaming(): void {
-    // Clear any existing interval
-    this.stopStreaming();
-
-    // Send updates every 2 seconds for more responsive feedback
-    this.streamingInterval = setInterval(() => {
-      this.flushPartialOutput();
-    }, 2000);
+  private ensureBlockSeparator(): void {
+    if (this.streamJsonResult && !/\s$/.test(this.streamJsonResult)) {
+      this.streamJsonResult += '\n\n';
+    }
   }
 
   /**
@@ -911,135 +1186,6 @@ export class AgentClient {
       clearInterval(this.streamingInterval);
       this.streamingInterval = null;
     }
-  }
-
-  /**
-   * Flush partial output if buffer has grown since last flush
-   */
-  private flushPartialOutput(): void {
-    if (!this.currentChatId || !this.currentTelegramId) {
-      return;
-    }
-
-    // Check if buffer has new content
-    if (this.outputBuffer.length <= this.lastFlushedLength) {
-      return;
-    }
-
-    // Update last flushed length
-    this.lastFlushedLength = this.outputBuffer.length;
-
-    // Clean the output
-    let cleaned = stripAnsi(this.outputBuffer);
-
-    // Parse for meaningful updates
-    const display = this.extractStreamingStatus(cleaned);
-
-    if (display.trim().length > 0) {
-      this.sendStreaming(this.currentChatId, display.trim());
-      // Mark that streaming has started (even if ack hasn't arrived yet)
-      // This prevents duplicate final responses in flushOutput()
-      if (this.currentMessageId === null) {
-        this.currentMessageId = -1; // Temporary marker until we get the real ID from ack
-      }
-    }
-  }
-
-  // Track last sent status to avoid duplicate updates
-  private lastSentStatus: string = '';
-
-  /**
-   * Extract meaningful status from Claude output for streaming display
-   */
-  private extractStreamingStatus(output: string): string {
-    const lines = output.split('\n');
-    const updates: string[] = [];
-
-    // Look for tool calls and actions - scan more lines for better detection
-    for (let i = lines.length - 1; i >= Math.max(0, lines.length - 100); i--) {
-      const line = lines[i].trim();
-
-      // Skip empty lines
-      if (!line) continue;
-
-      // Claude Code tool patterns (more comprehensive)
-      if (line.includes('Read(') || line.match(/Reading\s+[`"']?[\w/.]+/i)) {
-        const match = line.match(/(?:Read\(|Reading)\s*[`"']?([^`"'\s,)]+)/i);
-        if (match) updates.push(`</> Reading ${this.truncatePath(match[1])}`);
-      } else if (line.includes('Write(') || line.match(/Writing\s+[`"']?[\w/.]+/i)) {
-        const match = line.match(/(?:Write\(|Writing)\s*[`"']?([^`"'\s,)]+)/i);
-        if (match) updates.push(`[+] Writing ${this.truncatePath(match[1])}`);
-      } else if (line.includes('Edit(') || line.match(/Editing\s+[`"']?[\w/.]+/i)) {
-        const match = line.match(/(?:Edit\(|Editing)\s*[`"']?([^`"'\s,)]+)/i);
-        if (match) updates.push(`[~] Editing ${this.truncatePath(match[1])}`);
-      } else if (line.includes('Bash(') || line.match(/Running|Executing/i)) {
-        const match = line.match(/(?:Bash\(|Running|Executing)[:\s]*[`"']?(.{1,50})/i);
-        if (match) updates.push(`$__ ${match[1].replace(/[`"']/g, '').slice(0, 40)}...`);
-      } else if (line.includes('Glob(') || line.match(/Searching\s+files/i)) {
-        updates.push(`(*) Searching files...`);
-      } else if (line.includes('Grep(') || line.match(/Searching\s+code/i)) {
-        updates.push(`/?/ Searching code...`);
-      } else if (line.includes('WebSearch') || line.match(/searching\s+(?:the\s+)?web/i)) {
-        updates.push(`@-> Searching web...`);
-      } else if (line.includes('WebFetch') || line.match(/fetching\s+(?:page|url)/i)) {
-        updates.push(`<~> Fetching page...`);
-      } else if (line.match(/npm\s+(?:install|i\b)/i) || line.includes('Installing')) {
-        updates.push(`[*] Installing dependencies...`);
-      } else if (line.match(/npm\s+(?:run\s+)?build/i) || line.includes('Building')) {
-        updates.push(`[*] Building project...`);
-      } else if (line.match(/npm\s+(?:run\s+)?test/i) || line.includes('Testing')) {
-        updates.push(`[*] Running tests...`);
-      } else if (line.match(/git\s+(?:add|commit|push)/i)) {
-        const match = line.match(/git\s+(add|commit|push)/i);
-        if (match) updates.push(`[*] Git ${match[1]}...`);
-      } else if (line.match(/created?\s+(?:file|directory)/i)) {
-        const match = line.match(/created?\s+(?:file|directory)\s*:?\s*[`"']?([^`"'\s]+)/i);
-        if (match) updates.push(`[+] Created ${this.truncatePath(match[1])}`);
-      }
-
-      // Stop if we have enough updates
-      if (updates.length >= 5) break;
-    }
-
-    // Deduplicate and take most recent unique actions
-    const uniqueUpdates = [...new Set(updates)].slice(0, 4);
-
-    // If we found specific actions, show those
-    if (uniqueUpdates.length > 0) {
-      const status = uniqueUpdates.reverse().join('\n');
-      
-      // Send status update to server if changed
-      if (status !== this.lastSentStatus) {
-        this.lastSentStatus = status;
-        this.sendStatusUpdate(uniqueUpdates[uniqueUpdates.length - 1]);
-      }
-      
-      return status;
-    }
-
-    // Otherwise show last few non-empty lines
-    const recentLines = lines
-      .slice(-10)
-      .filter(l => l.trim().length > 0 && !l.match(/^\s*[\[\]{}]\s*$/)) // Skip JSON brackets
-      .slice(-3);
-
-    if (recentLines.length > 0) {
-      let display = recentLines.join('\n');
-      if (display.length > 300) {
-        display = '...' + display.slice(-297);
-      }
-      
-      // Send generic "Working..." status when we have output but no specific action
-      const genericStatus = 'Working...';
-      if (genericStatus !== this.lastSentStatus) {
-        this.lastSentStatus = genericStatus;
-        this.sendStatusUpdate(genericStatus);
-      }
-      
-      return display;
-    }
-
-    return output.length > 300 ? '...\n' + output.slice(-297) : output;
   }
 
   /**
@@ -1275,8 +1421,6 @@ export class AgentClient {
   private flushOutput(): void {
     // With stream-json, final response is handled in the 'close' handler
     // This is kept as a no-op for any code paths that still call it
-    this.outputBuffer = '';
-    this.lastFlushedLength = 0;
     this.currentMessageId = null;
   }
 
@@ -1299,9 +1443,21 @@ export class AgentClient {
     // can leave the socket stuck in CONNECTING state for whatever the OS
     // timeout is (often minutes), blocking the reconnect loop. Cleared on
     // every terminal event below.
+    //
+    // `terminate()` on a socket still in CONNECTING is reported by ws as an
+    // 'error' carrying a fixed message ("WebSocket was closed before the
+    // connection was established"), emitted just before 'close'. That error
+    // IS this watchdog firing, not a fault we hit, so it is flagged here and
+    // read by the error handler below. Untagged, it reached prod's error log
+    // at error level and was scraped into the admin Server Errors panel as an
+    // unexplained failure, while the reconnect it triggered worked perfectly
+    // (2026-08-16). Only this call site can produce it: the heartbeat and wake
+    // watchdogs start inside 'open', so their terminate() always sees OPEN.
+    let handshakeAborted = false;
     let handshakeTimer: NodeJS.Timeout | null = setTimeout(() => {
       handshakeTimer = null;
       if (this.ws && this.ws.readyState === WebSocket.CONNECTING) {
+        handshakeAborted = true;
         console.log('[Connect] Handshake timed out after 10s — terminating');
         try { this.ws.terminate(); } catch {}
       }
@@ -1340,6 +1496,15 @@ export class AgentClient {
           platform: os.platform(),
           workingDirectory: this.workingDirectory,
           branch: this.currentGitBranch(),
+          // Additive: lets the phone show what this machine is set to without
+          // waiting for a config change to happen. Deliberately NOT carrying
+          // `supervised` — that one is the server's, and reporting our copy
+          // on every reconnect would fight the iOS toggle.
+          model: this.config.getModel() || null,
+          allowedTools: this.reportedAllowedTools(),
+          // Additive (2026-09-14): lets the phone label the machine. Servers
+          // older than Codex support ignore it.
+          engine: this.engine,
         },
         timestamp: Date.now(),
         messageId: this.generateId(),
@@ -1359,6 +1524,7 @@ export class AgentClient {
       clearHandshakeTimer();
       console.log('Disconnected from VibeKit');
       this.isConnected = false;
+      this.denyAllPendingApprovals('The phone disconnected.');
       this.stopHeartbeatWatchdog();
       this.stopWakeWatchdog();
       this.scheduleReconnect();
@@ -1366,8 +1532,17 @@ export class AgentClient {
 
     this.ws.on('error', (error) => {
       clearHandshakeTimer();
-      console.error('WebSocket error:', error.message);
       this.isConnected = false;
+      this.denyAllPendingApprovals('The phone connection failed.');
+      if (handshakeAborted) {
+        // Our own 10s watchdog aborted this handshake and already logged why.
+        // ws emits 'close' straight after, which schedules the reconnect, so
+        // there is nothing to report and nothing more to do. Reset the flag so
+        // a genuine error later on this socket is still logged.
+        handshakeAborted = false;
+        return;
+      }
+      console.error('WebSocket error:', error.message);
       const msg = error?.message || '';
       if (msg.includes('ENOTFOUND') || msg.includes('EAI_AGAIN')) {
         this.lastErrorWasDns = true;
@@ -1485,7 +1660,7 @@ export class AgentClient {
         // (Phase 4 multi-remote-agents). Surface it on stdout so the
         // user knows which paired machine this CLI represents — handy
         // when juggling multiple terminals across laptop + remote box.
-        const payload = message.payload as { telegramId: number; agentName?: string } | undefined;
+        const payload = message.payload as { telegramId: number; agentName?: string; latestAgentVersion?: string } | undefined;
         const label = payload?.agentName?.trim();
         if (label) {
           console.log(`Authenticated as "${label}"`);
@@ -1500,14 +1675,37 @@ export class AgentClient {
         // Replay anything we couldn't send while the WS was down — the tail
         // of a turn that finished mid-disconnect lands here on reconnect.
         this.flushOutboundQueue();
+        // The server tells us the latest published version on every auth.
+        // If we're behind, update + restart ourselves so the user never has
+        // to copy-paste a command on the machine. Best-effort, fire-and-forget.
+        void this.maybeSelfUpdate(payload?.latestAgentVersion);
         break;
       }
 
-      case 'auth_error':
-        console.error('Authentication failed:', (message.payload as { message: string }).message);
-        this.config.clear();
+      case 'auth_error': {
+        // Deleting the stored token is IRREVERSIBLE from this machine (the
+        // user has to fetch a fresh link code from their phone), so it only
+        // happens when the server explicitly says the token itself is bad.
+        // Servers ≥2026-08-02 stamp that case code:'invalid_token'; anything
+        // else (or a legacy server's bare auth_error) is treated as
+        // transient: keep the token, exit, and let the supervisor/user
+        // restart into a normal reconnect. Before this gate, a server-side
+        // DB blip during auth wiped the token and pm2 crash-looped
+        // "No token found" 43k times (2026-08-01).
+        const payload = (message.payload as { message: string; code?: string }) || { message: 'unknown' };
+        console.error('Authentication failed:', payload.message);
+        if (payload.code === 'invalid_token') {
+          console.error('This machine\'s pairing is no longer valid. Run "vibekit-agent link" with a fresh code from the app.');
+          this.config.clear();
+        } else {
+          console.error('Keeping the stored pairing — this looks like a temporary server problem. Retrying shortly...');
+          // Don't exit: schedule a normal reconnect like a dropped socket.
+          this.scheduleReconnect();
+          break;
+        }
         process.exit(1);
         break;
+      }
 
       case 'message':
         this.handleUserMessage(message as UserMessage);
@@ -1539,6 +1737,13 @@ export class AgentClient {
         this.handleWriteEnv((message.payload as { envVars: { key: string; value: string }[] }).envVars);
         break;
 
+      case 'permission_response': {
+        const { requestId, behavior, message: denyMessage } =
+          (message.payload as { requestId: string; behavior: 'allow' | 'deny'; message?: string }) || {};
+        this.resolveApproval(requestId, behavior === 'allow' ? 'allow' : 'deny', denyMessage);
+        break;
+      }
+
       case 'streaming_ack':
         // Server acknowledged streaming message and sent back Telegram messageId
         const ack = message.payload as { messageId: number };
@@ -1554,10 +1759,129 @@ export class AgentClient {
   }
 
   /**
+   * Auto-update: when the server reports a newer published version than the
+   * one we're running, install it and restart to load it — so the user can
+   * update entirely from their phone instead of copy-pasting a command on the
+   * machine. Best-effort and conservative:
+   *   - skipped in auto mode (ephemeral containers reinstall per run, and a
+   *     mid-build restart would kill the task)
+   *   - skipped when a Claude run is in flight (we'd interrupt it); a later
+   *     reconnect retries, so we intentionally DON'T set updateAttempted here
+   *   - opt-out with VIBEKIT_AGENT_NO_AUTOUPDATE=1
+   *   - runs at most once per process, even across reconnect storms
+   * An install failure (e.g. a global npm dir needing sudo) is logged and we
+   * stay on the current version — the iOS tile's "Update" badge still nudges
+   * the manual path, so nothing regresses.
+   */
+
+  /**
+   * True when `candidate` is a strictly higher release than `current`.
+   * Deliberately fail-closed: anything unparseable (prerelease tags, empty
+   * strings, 'unknown' from a failed package.json read) returns false, so a
+   * malformed version can never trigger an update-and-restart cycle.
+   */
+  private static isNewerVersion(candidate: string, current: string): boolean {
+    const parse = (v: string): [number, number, number] | null => {
+      const m = /^(\d+)\.(\d+)\.(\d+)/.exec(String(v).trim());
+      return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+    };
+    const a = parse(candidate);
+    const b = parse(current);
+    if (!a || !b) return false;
+    for (let i = 0; i < 3; i++) {
+      if (a[i] !== b[i]) return a[i] > b[i];
+    }
+    return false;
+  }
+
+  private async maybeSelfUpdate(latest?: string): Promise<void> {
+    if (process.env.VIBEKIT_AGENT_NO_AUTOUPDATE) return;
+    if (this.autoMode) return;
+    // Only ever move FORWARD. This used to be `latest !== AGENT_VERSION`,
+    // which treats "the server's cached latest is OLDER than what I run" as
+    // an update: the agent then reinstalls @latest (a no-op), restarts, and
+    // the fresh process repeats the whole dance, because updateAttempted is
+    // per-process. That is an unbounded restart loop, and it fired for real
+    // when a deploy restarted the server minutes before a publish, leaving
+    // its hourly npm cache one version behind the agent (2026-08-02, 17
+    // restarts in 20s). A stale or rolled-back cache must be a no-op.
+    if (!latest || !AgentClient.isNewerVersion(latest, AGENT_VERSION)) return;
+    if (this.updateAttempted) return;
+    if (this.activeRun) {
+      // Busy — don't interrupt a run. Leave updateAttempted unset so the next
+      // reconnect (or the next idle auth) tries again.
+      console.log(`[Auto-update] v${latest} available but a task is running — will update when idle.`);
+      return;
+    }
+    this.updateAttempted = true;
+    console.log(`\n[Auto-update] New version available: v${AGENT_VERSION} -> v${latest}. Installing...`);
+    // NOTE: installs the `latest` dist-tag, not a pinned `@${latest}` — the
+    // registry is the authority on what "latest" resolves to.
+
+    execFile(
+      'npm',
+      ['install', '-g', 'vibekit-agent@latest'],
+      { timeout: 180_000, env: process.env },
+      (err, _stdout, stderr) => {
+        if (err) {
+          // npm's stderr is dozens of "npm error" lines; dumping a tail of it
+          // put one phantom UNCAUGHT row PER LINE on the admin failures panel
+          // (29 rows for one EACCES on 2026-08-01). Distill to the lines that
+          // identify the failure and emit exactly one log line.
+          const gist = (stderr || '')
+            .split('\n')
+            .map((l) => l.trim())
+            .filter((l) => /^npm error (code|syscall|path|errno|Error:)/.test(l))
+            .map((l) => l.replace(/^npm error\s*/, ''))
+            .slice(0, 4)
+            .join(' | ');
+          console.error(`[Auto-update] Install failed: ${err.message}${gist ? ` (${gist})` : ''}. Staying on v${AGENT_VERSION}. Update manually with: npm install -g vibekit-agent@latest`);
+          return;
+        }
+        console.log(`[Auto-update] Installed v${latest}. Restarting to load it...`);
+        this.restartForUpdate(latest);
+      },
+    );
+  }
+
+  /**
+   * Restart this process so the freshly-installed code takes over.
+   *   - Under pm2 (pm_id/PM2_HOME set): just exit — pm2 re-forks the script,
+   *     which now points at the updated files on disk.
+   *   - Otherwise (bare terminal, nohup, tmux/screen): spawn a DETACHED copy
+   *     with the same argv (start [-d dir] …) — argv[1] is the global bin that
+   *     npm just overwrote in place, so the child loads the new code — then
+   *     exit. The server drops the stale connection when the child re-auths
+   *     with the same token.
+   * A systemd unit with Restart= behaves like pm2 (the detached child is
+   * killed with the cgroup on exit, then systemd restarts the unit fresh).
+   */
+  private restartForUpdate(latest: string): void {
+    const underPm2 = process.env.pm_id != null || !!process.env.PM2_HOME;
+    if (!underPm2) {
+      try {
+        const child = spawn(process.execPath, process.argv.slice(1), {
+          cwd: process.cwd(),
+          env: process.env,
+          detached: true,
+          stdio: 'ignore',
+        });
+        child.unref();
+      } catch (e: any) {
+        console.error(`[Auto-update] Could not spawn the replacement process: ${e?.message || e}. Exiting — restart the agent to run v${latest}.`);
+      }
+    }
+    // Let the last WS frames flush, then exit so the replacement (or the
+    // supervisor) takes over the connection.
+    setTimeout(() => process.exit(0), 500);
+  }
+
+  /**
    * Handle user message from Telegram or iOS app
    */
   private handleUserMessage(message: UserMessage): void {
-    const { chatId, text, telegramId, messageId, attachments } = message.payload;
+    const { chatId, text, telegramId, messageId, attachments, supervised } = message.payload;
+    this.currentSupervised = !!supervised && !this.autoMode;
 
     // If a previous run is still in flight when a new message arrives, send
     // a "canceled" acknowledgment to ITS chatId before we overwrite
@@ -1565,7 +1889,7 @@ export class AgentClient {
     // runClaude) — the user's first message bubble + spinner just hung
     // forever with no signal. Now they see an explicit cancellation in
     // the original chat and the new message proceeds normally.
-    if (this.claudeProcess && this.currentChatId && this.currentChatId !== chatId) {
+    if (this.activeRun && this.currentChatId && this.currentChatId !== chatId) {
       this.sendResponse(
         this.currentChatId,
         "_Canceled — you sent a new message before this one finished._",
@@ -1578,6 +1902,8 @@ export class AgentClient {
     this.currentReplyToMessageId = messageId;
 
     let prompt = text || '';
+    // Codex gets images as real inputs (localImage), on top of the path in the prompt.
+    const imagePaths: string[] = [];
     const attachmentInfo = attachments?.length ? ` with ${attachments.length} attachment(s)` : '';
     const source = chatId < 0 ? 'iOS' : 'Telegram';
     console.log(`\nReceived from ${source}: ${text || '(no text)'}${attachmentInfo}`);
@@ -1595,6 +1921,7 @@ export class AgentClient {
           } else if (file.type === 'image') {
             // For images, ask Claude to analyze
             prompt = `[Image saved to: ${file.path}]\n\nPlease analyze this image.\n\n${prompt}`.trim();
+            imagePaths.push(file.path);
           } else {
             // For documents, mention the file
             prompt = `[File saved to: ${file.path}]\n\n${prompt}`.trim();
@@ -1618,8 +1945,136 @@ export class AgentClient {
     // a slow spawn looks identical to a hung agent.
     this.sendStreaming(chatId, 'Starting…');
 
-    // Run claude with the prompt (stream-json will send status updates)
-    this.runClaude(prompt);
+    // Run the engine (its events send status updates)
+    if (this.engine === 'codex') {
+      this.runCodex(prompt, imagePaths);
+    } else {
+      this.runClaude(prompt);
+    }
+  }
+
+  /**
+   * Run one Codex turn through app-server. Shares the run bookkeeping with
+   * runClaude (supersedeActiveRun, beginRun, settleRun), so Stop, supersede,
+   * the run timeout and the self-update idle check behave the same. Every
+   * event mapping is in codex-translate.ts.
+   */
+  private runCodex(prompt: string, imagePaths: string[]): void {
+    this.supersedeActiveRun();
+    const chatId = this.currentChatId;
+
+    // Looked up again while missing, so installing Codex works from the next message.
+    if (!this.codexBinary) this.codexBinary = findCodexBinary();
+    const binary = this.codexBinary;
+    if (!binary) {
+      if (chatId) this.sendResponse(chatId, CODEX_NOT_INSTALLED, 'complete');
+      return;
+    }
+    if (!this.codex || this.codex.binary !== binary.path) {
+      this.codex?.dispose();
+      this.codex = new CodexEngine(binary.path, AGENT_VERSION);
+    }
+    const codex = this.codex;
+
+    let stopTurn: (() => void) | null = null;
+    const run: ActiveRun = { engine: 'codex', stop: () => stopTurn?.() };
+    this.beginRun(run);
+
+    const access = codexAccessFor(this.config.getAllowedTools(), this.currentSupervised);
+    const cwd = this.workingDirectory;
+    const turn = codex.startTurn({
+      prompt,
+      imagePaths,
+      cwd,
+      model: this.config.getModel(),
+      access,
+      mcpServers: () => this.codexMcpServers(codex, access, cwd),
+    }, {
+      output: (o) => {
+        if (this.activeRun !== run || this.canceledRuns.has(run)) return;
+        this.cancelHeartbeats();
+        if (o.kind === 'text') {
+          this.streamJsonResult = o.text;
+          this.scheduleStreamingFlush();
+        } else if (o.kind === 'status') {
+          this.sendStatusUpdate(o.text);
+        } else if (this.currentChatId) {
+          this.send({
+            type: 'tool_invocation',
+            payload: { chatId: this.currentChatId, ...o.tool },
+            timestamp: Date.now(),
+            messageId: this.generateId(),
+          });
+        }
+      },
+      approve: async (toolName, input) => {
+        if (this.activeRun !== run || this.canceledRuns.has(run)) return false;
+        return (await this.askPhone(toolName, input)).behavior === 'allow';
+      },
+    });
+    stopTurn = turn.stop;
+    void turn.done.then((end) => this.endCodexRun(run, end, codex));
+  }
+
+  private endCodexRun(run: ActiveRun, end: CodexTurnEnd, codex: CodexEngine): void {
+    const settled = this.settleRun(run);
+    console.log(`\nCodex turn ended: ${end.status}${end.error ? ` (${end.error.info})` : ''}`);
+    if (!settled) return;
+    this.stopStreaming();
+    this.clearStreamingFlush();
+
+    if (this.currentChatId && this.currentTelegramId) {
+      const narration = end.text.trim();
+      if (end.status === 'completed') {
+        this.sendResponse(this.currentChatId, narration || this.noReplyFallback(0, end.toolCount), 'complete');
+      } else {
+        // A normal `complete` reply, never `status: 'error'`: iOS rewrites the
+        // text of SSE error events with Claude-specific help, on every build
+        // in the wild. Narration the user watched stays above the error.
+        const errLine = end.error
+          ? codexErrorReply(end.error, { resetsAtSec: codex.rateLimitResetsAtSec, testedVersion: CODEX_TESTED_VERSION })
+          : 'Codex ended this run before it finished. Send your message again.';
+        this.sendResponse(this.currentChatId, narration ? `${narration}\n\n_${errLine}_` : errLine, 'complete');
+      }
+    }
+    this.activeRun = null;
+  }
+
+  /** Per-thread MCP tools. Read-only mode gets filesystem readers because its native shell is disabled. */
+  private codexMcpServers(codex: CodexEngine, access: CodexAccess, cwd: string): Record<string, McpServerSpec> {
+    const configScript = path.join(__dirname, 'config-mcp.js');
+    const servers: Record<string, McpServerSpec> = {};
+    if (this.controlPort && fs.existsSync(configScript)) {
+      servers[VKCONFIG_SERVER] = {
+        command: process.execPath,
+        args: [configScript],
+        env: { VK_CONFIG_PORT: String(this.controlPort), VK_ENGINE: 'codex', VK_MODELS: codex.models.join(',') },
+        // The config tools never need a tap, the same as CONFIG_TOOL_NAMES on
+        // Claude; a loosening already asks the phone inside the tool itself.
+        // 'approve', not 'auto': measured live on Codex 0.154.0, 'auto' still
+        // requires approval (an elicitation when supervised, a hard failure
+        // under approvalPolicy never), 'approve' runs the tool.
+        approvalMode: 'approve',
+      };
+    }
+    const readScript = path.join(__dirname, 'codex-read-mcp.js');
+    if (access === 'read-only' && fs.existsSync(readScript)) {
+      servers.vkread = {
+        command: process.execPath,
+        args: [readScript],
+        env: { VK_READ_ROOT: cwd },
+        // Read-only runs under approvalPolicy never, where a tool that needs
+        // approval simply fails: with 'auto' every read failed in the live test.
+        approvalMode: 'approve',
+      };
+    }
+    return servers;
+  }
+
+  /** The tool list the phone is shown: the raw list for Claude, and for Codex the access actually in force. */
+  private reportedAllowedTools(): string[] {
+    const tools = this.config.getAllowedTools();
+    return this.engine === 'codex' ? codexReportedTools(tools) : tools;
   }
 
   /**
@@ -1666,6 +2121,7 @@ export class AgentClient {
   private handleNewConversation(): void {
     this.hasActiveConversation = false;
     this.currentSessionId = null;
+    this.codex?.resetThread();
     console.log('Conversation reset - next message will start fresh');
   }
 
@@ -1676,17 +2132,378 @@ export class AgentClient {
    * "working". Mirrors the supersede-by-new-message path: claudeWasCanceled
    * suppresses the close handler's "exited without response" double-send.
    */
+
+  // ── Supervised-mode approval plumbing ──────────────────────────────
+
+  /**
+   * Bind (once) the localhost HTTP server our MCP children call back on.
+   *
+   * Awaited at startup rather than done inline where it is needed, because
+   * binding is ASYNCHRONOUS: `listen(0, '127.0.0.1')` resolves the host
+   * through dns.lookup first, so `server.address()` on the next line is null.
+   * The inline version read it there and threw "control server failed to
+   * bind" on every single run — which the caller swallowed, so self-config
+   * (and supervised mode's approval prompts) silently never attached from the
+   * day they shipped. runClaude() is synchronous and cannot await, so the
+   * port has to already exist by the time it builds the argv.
+   *
+   * Resolves either way: a box that cannot bind loopback still gets a working
+   * agent, minus self-config, and is told so rather than failing to start.
+   */
+  private ensureControlServer(): Promise<void> {
+    if (this.controlServer) return Promise.resolve();
+    return new Promise((resolve) => {
+      const server = http.createServer((req, res) => this.handleControlHttpRequest(req, res));
+      server.once('error', (e: any) => {
+        console.error(`Self-config and supervised mode are unavailable: control server could not bind (${e?.message || e}).`);
+        resolve();
+      });
+      server.listen(0, '127.0.0.1', () => {
+        const addr = server.address();
+        if (addr && typeof addr !== 'string') {
+          this.controlPort = addr.port;
+          this.controlServer = server;
+        }
+        server.unref(); // never keep the process alive on its own
+        resolve();
+      });
+    });
+  }
+
+  /**
+   * Write the --mcp-config file pointing claude at our MCP children. Returns
+   * the config path, or null when there is no MCP server worth attaching.
+   *
+   * `withApproval` adds the supervised-mode permission-prompt server. Throws
+   * when the plumbing it needs is missing: a missing approval-mcp.js must
+   * fail CLOSED (runClaude falls back to tool restrictions), while a missing
+   * config-mcp.js just means no self-config this run.
+   */
+  private ensureMcpPlumbing(withApproval: boolean): string | null {
+    const approveScript = path.join(__dirname, 'approval-mcp.js');
+    const configScript = path.join(__dirname, 'config-mcp.js');
+    if (withApproval && !fs.existsSync(approveScript)) throw new Error(`missing ${approveScript}`);
+    const withConfig = fs.existsSync(configScript);
+    if (!withApproval && !withConfig) return null;
+
+    if (!this.controlPort) throw new Error('control server is not listening');
+
+    // Port is baked into the config env, so rewrite whenever it changes
+    // (fresh process = fresh ephemeral port). Rewritten per run rather than
+    // once, because which servers belong in it depends on supervised mode:
+    // declaring vkapprove outside supervised mode would offer claude a tool
+    // that is never the right thing to call.
+    if (!this.mcpConfigPath) {
+      this.mcpConfigPath = path.join(os.tmpdir(), `vibekit-mcp-${process.pid}.json`);
+    }
+    const mcpServers: Record<string, unknown> = {};
+    if (withApproval) {
+      mcpServers.vkapprove = {
+        command: process.execPath,
+        args: [approveScript],
+        env: { VK_APPROVAL_PORT: String(this.controlPort) },
+      };
+    }
+    if (withConfig) {
+      mcpServers.vkconfig = {
+        command: process.execPath,
+        args: [configScript],
+        env: { VK_CONFIG_PORT: String(this.controlPort) },
+      };
+    }
+    fs.writeFileSync(this.mcpConfigPath, JSON.stringify({ mcpServers }), { mode: 0o600 });
+    return this.mcpConfigPath;
+  }
+
+  /** Router for the two things our MCP children POST back to us. */
+  private handleControlHttpRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
+    if (req.method !== 'POST' || (req.url !== '/approve' && req.url !== '/config')) {
+      res.writeHead(404).end();
+      return;
+    }
+    const isConfig = req.url === '/config';
+    let body = '';
+    req.on('data', (c) => { body += c; if (body.length > 64_000) req.destroy(); });
+    req.on('end', () => {
+      let parsed: any = {};
+      try { parsed = JSON.parse(body); } catch { /* keep defaults */ }
+      const reply = (payload: unknown) => {
+        try {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(payload));
+        } catch { /* MCP child already gone — claude was killed */ }
+      };
+
+      if (isConfig) {
+        // The rejection arm matters: an unhandled throw would never call
+        // reply(), and the MCP child would sit on its 200s socket timeout
+        // with claude blocked behind it. An error is a far better failure
+        // than a three-minute hang.
+        void this.handleConfigToolCall(parsed).then(reply, (e: any) => {
+          console.error(`[Config] handler threw: ${e?.message || e}`);
+          reply({ ok: false, text: 'The agent hit an error applying that, so nothing changed.' });
+        });
+        return;
+      }
+
+      const toolName = typeof parsed?.toolName === 'string' ? parsed.toolName : 'unknown tool';
+      const input = (parsed?.input && typeof parsed.input === 'object') ? parsed.input : {};
+      // Trim the input we ship to the phone: a Write's full content can be
+      // hundreds of KB; the card only needs enough to decide.
+      const slim: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(input as Record<string, unknown>)) {
+        slim[k] = typeof v === 'string' && v.length > 2_000 ? v.slice(0, 2_000) + '…' : v;
+      }
+      void this.askPhone(toolName, slim).then(reply);
+    });
+  }
+
+  /**
+   * Put a question on the user's phone and wait for the answer. Used by the
+   * supervised-mode tool prompt and by a config change that would reduce
+   * safety, so both share one deadline, one cancel path, and one card.
+   * Resolves to a deny (never rejects) when there is no phone to ask.
+   */
+  private askPhone(toolName: string, input: Record<string, unknown>): Promise<PhoneDecision> {
+    const chatId = this.currentChatId;
+    if (!chatId || !this.isConnected) {
+      return Promise.resolve({ behavior: 'deny', message: 'VibeKit is not connected, so no one could approve this.' });
+    }
+    return new Promise<PhoneDecision>((resolve) => {
+      const requestId = randomUUID();
+      const expiresAt = Date.now() + AgentClient.APPROVAL_TIMEOUT_MS;
+      const timer = setTimeout(() => {
+        this.resolveApproval(requestId, 'deny', 'No answer from your phone in 3 minutes — denied. Send the message again when you are ready.');
+      }, AgentClient.APPROVAL_TIMEOUT_MS);
+      this.pendingApprovals.set(requestId, { resolve, timer });
+
+      this.send({
+        type: 'permission_request',
+        payload: { chatId, requestId, toolName, input, expiresAt },
+        timestamp: Date.now(),
+        messageId: this.generateId(),
+      });
+      console.log(`[Supervised] Asking phone: ${toolName} (${requestId.slice(0, 8)})`);
+    });
+  }
+
+  /** Answer a pending approval (phone decision, timeout, or cancel). */
+  private resolveApproval(requestId: string, behavior: 'allow' | 'deny', message?: string): void {
+    const pending = this.pendingApprovals.get(requestId);
+    if (!pending) return; // already resolved / expired — idempotent
+    this.pendingApprovals.delete(requestId);
+    clearTimeout(pending.timer);
+    pending.resolve({ behavior, message });
+    console.log(`[Supervised] ${behavior}${message ? ` (${message})` : ''} for ${requestId.slice(0, 8)}`);
+  }
+
+  // ── Self-configuration (the vkconfig MCP tools) ────────────────────
+
+  /** Human-readable current settings, for get_config and for confirmations. */
+  private describeConfig(): string {
+    const model = this.config.getModel();
+    const tools = this.config.getAllowedTools();
+    if (this.engine === 'codex') {
+      return [
+        'Engine: Codex',
+        `Model: ${model || 'Codex default'}`,
+        `Tool access: ${codexAccessFor(tools, false) === 'full' ? 'full (edits and commands allowed)' : 'read-only (no edits, no commands)'}`,
+        `Working directory: ${this.workingDirectory}`,
+        `Supervised mode: ${this.currentSupervised ? 'on' : 'off'}`,
+      ].join('\n');
+    }
+    return [
+      `Model: ${model || 'default (whatever your claude install picks)'}`,
+      `Allowed tools: ${tools.length === 0 ? 'all (no restrictions)' : tools.join(', ')}`,
+      `Working directory: ${this.workingDirectory}`,
+      `Supervised mode: ${this.currentSupervised ? 'on' : 'off'}`,
+    ].join('\n');
+  }
+
+  /**
+   * POST /config from the vkconfig MCP child: the agent changing its own
+   * settings because the conversation asked it to.
+   *
+   * Atomic. A call carrying both a safe change and a refused one applies
+   * NEITHER, because partially-applied settings are the kind of thing a user
+   * discovers three days later.
+   */
+  private async handleConfigToolCall(body: any): Promise<{ ok: boolean; text: string }> {
+    if (body?.action === 'get') return { ok: true, text: this.describeConfig() };
+    if (body?.action !== 'set') return { ok: false, text: 'Unsupported settings action.' };
+
+    const raw: Record<string, unknown> = (body?.changes && typeof body.changes === 'object') ? body.changes : {};
+
+    // Refuse unknown keys BY NAME instead of dropping them. The MCP schema
+    // does not offer `token` or `wsUrl`, but a schema is a hint to the model,
+    // not a gate — this is the gate. Writing `wsUrl` would re-point the agent
+    // at someone else's server and hand over the machine, so it has to be
+    // visibly impossible rather than quietly ignored, which would read back
+    // to the model (and then the user) as "done".
+    const unknown = Object.keys(raw).filter((k) => !(CONFIG_CHANGE_KEYS as readonly string[]).includes(k));
+    if (unknown.length > 0) {
+      return {
+        ok: false,
+        text: `Refused: ${unknown.join(', ')} cannot be changed from a conversation. `
+          + 'The pairing itself (auth token and server URL) is deliberately not settable this way. '
+          + `Changeable settings are: ${CONFIG_CHANGE_KEYS.join(', ')}.`,
+      };
+    }
+
+    const next: ConfigChange = {};
+    if ('model' in raw) {
+      const m = raw.model;
+      if (m !== null && typeof m !== 'string') return { ok: false, text: 'model must be a string, or null to clear it.' };
+      if (typeof m === 'string' && !isValidModel(m, this.engine)) {
+        return {
+          ok: false,
+          text: this.engine === 'codex'
+            ? `"${m}" is not a Codex model name.`
+            : `"${m}" is not a model name claude accepts. Use opus, sonnet, haiku, or a full claude model id.`,
+        };
+      }
+      const codexModels = this.engine === 'codex' ? (this.codex?.models ?? []) : [];
+      if (typeof m === 'string' && codexModels.length > 0 && !codexModels.includes(m.trim())) {
+        return { ok: false, text: `"${m}" is not a model this Codex offers. Available: ${codexModels.join(', ')}.` };
+      }
+      next.model = m as string | null;
+    }
+    if ('allowedTools' in raw) {
+      const t = raw.allowedTools;
+      if (!Array.isArray(t) || t.some((x) => typeof x !== 'string' || !x.trim())) {
+        return { ok: false, text: 'allowedTools must be an array of tool names.' };
+      }
+      next.allowedTools = (t as string[]).map((x) => x.trim());
+      // Codex cannot honor a list allowing edits but not commands (or the
+      // reverse). Refuse it by name rather than store a setting not in force.
+      const problem = this.engine === 'codex' ? codexToolListProblem(next.allowedTools) : null;
+      if (problem) return { ok: false, text: `${problem} Nothing changed.` };
+    }
+    if ('cwd' in raw) {
+      if (typeof raw.cwd !== 'string' || !raw.cwd.trim()) return { ok: false, text: 'cwd must be a path.' };
+      next.cwd = raw.cwd.trim();
+    }
+    if ('supervised' in raw) {
+      if (typeof raw.supervised !== 'boolean') return { ok: false, text: 'supervised must be true or false.' };
+      next.supervised = raw.supervised;
+    }
+    if (Object.keys(next).length === 0) return { ok: false, text: 'No settings were named, so nothing changed.' };
+
+    // Anything that reduces safety costs a tap on the phone, even when
+    // supervised mode is off. The agent reads repos, issue text and web
+    // pages, so the realistic attack is a poisoned file telling it to disarm
+    // the user's own gate. Failure to reach the phone is a REFUSAL.
+    const loosenings = describeLoosenings(
+      { allowedTools: this.config.getAllowedTools(), supervised: this.currentSupervised },
+      next,
+    );
+    if (loosenings.length > 0) {
+      const summary = loosenings.join(' and ');
+      // PHRASING IS CONSTRAINED BY THE SHIPPED CLIENT, not by taste. The card
+      // renders `"Agent wants to run \(toolName)"` (NativeRemoteView) and the
+      // push falls through to `"Wants to run \(toolName)"` (permissionSummary
+      // in remote-agent.ts) whenever the input carries no command/file_path/
+      // path/url key, which ours never will. Both of those templates are in
+      // App Store builds that are already on phones and cannot be changed, so
+      // the toolName has to complete those sentences by itself. A bare label
+      // here renders as "Agent wants to run VibeKit settings", which is the
+      // last thing the one card that guards against prompt injection should
+      // look like. Keep this a phrase that reads after "wants to run".
+      const decision = await this.askPhone(`a settings change: ${summary}`, {
+        note: 'This reduces what the agent has to ask you about before it acts. Approve only if you just asked for this.',
+      });
+      if (decision.behavior !== 'allow') {
+        return { ok: false, text: `Refused: ${summary} was not approved on the phone${decision.message ? ` (${decision.message})` : ''}. Nothing changed.` };
+      }
+    }
+
+    // ORDER IS LOAD-BEARING for the atomicity promised above. Every field was
+    // validated and the approval gate cleared before we got here, so the only
+    // thing left that can fail is a directory that does not exist — which is
+    // why cwd goes FIRST and can honestly report "nothing else changed".
+    // setModel cannot throw after isValidModel, and setAllowedTools swallows
+    // its own write errors. Reorder this and the guarantee quietly weakens.
+    const applied: string[] = [];
+    if (next.cwd !== undefined) {
+      // Reuse the cd path so the directory is validated once and the server
+      // gets its cd_result exactly as it does for a server-initiated cd.
+      const result = this.changeDirectory(next.cwd);
+      if (!result.success) return { ok: false, text: `Could not switch directory: ${result.error}. Nothing else changed.` };
+      applied.push(`working directory is now ${result.path}`);
+    }
+    if (next.model !== undefined) {
+      try { this.config.setModel(next.model); } catch (e: any) { return { ok: false, text: e?.message || 'Could not set the model.' }; }
+      applied.push(next.model === null ? 'model override cleared' : `model is now ${next.model}`);
+    }
+    if (next.allowedTools !== undefined) {
+      this.config.setAllowedTools(next.allowedTools);
+      applied.push(next.allowedTools.length === 0
+        ? 'tool restrictions removed'
+        : `tools restricted to ${next.allowedTools.join(', ')}`);
+    }
+    if (next.supervised !== undefined) {
+      applied.push(`supervised mode ${next.supervised ? 'on' : 'off'}`);
+    }
+    if (this.engine === 'codex'
+      && (next.model !== undefined || next.allowedTools !== undefined || next.supervised !== undefined)) {
+      // These are thread-scoped in Codex. Retire the old subscription now,
+      // even if the user never sends the "next message" mentioned below.
+      this.codex?.resetThread();
+    }
+
+    // Tell the server, so the phone shows the same thing and `supervised`
+    // (which is server-owned, on the remote_agents row) actually persists.
+    this.sendConfigState(next.supervised);
+
+    return {
+      ok: true,
+      text: `Done: ${applied.join('; ')}. This takes effect on your NEXT message, not this one.`,
+    };
+  }
+
+  /**
+   * Report settings upward. `supervised` is included ONLY when the user just
+   * asked to change it: the flag is owned by the server (it rides down on
+   * each UserMessage), and echoing our stale copy back on every change would
+   * let a config edit clobber a toggle made from the iOS sheet in between.
+   */
+  private sendConfigState(supervised?: boolean): void {
+    this.send({
+      type: 'config_state',
+      payload: {
+        model: this.config.getModel() || null,
+        allowedTools: this.reportedAllowedTools(),
+        workingDirectory: this.workingDirectory,
+        ...(supervised === undefined ? {} : { supervised }),
+      },
+      timestamp: Date.now(),
+      messageId: this.generateId(),
+    });
+  }
+
+  /** Deny everything in flight — cancel, new message, or shutdown. */
+  private denyAllPendingApprovals(reason: string): void {
+    for (const id of [...this.pendingApprovals.keys()]) {
+      this.resolveApproval(id, 'deny', reason);
+    }
+  }
+
   private handleCancel(): void {
-    if (!this.claudeProcess) {
+    const run = this.activeRun;
+    if (!run) {
       console.log('[Agent] Cancel received — no run in flight (no-op)');
       this.sendStatus('idle');
       return;
     }
-    console.log('[Agent] Cancel received — stopping current Claude run');
-    this.claudeWasCanceled = true;
+    console.log(`[Agent] Cancel received, stopping the current ${run.engine} run`);
+    this.denyAllPendingApprovals('Task was stopped from the app.');
+    this.canceledRuns.add(run);
     this.cancelHeartbeats();
     this.stopStreaming();
-    try { this.claudeProcess.kill(); } catch { /* already gone */ }
+    // Kill the pending debounced frame so no streaming text lands after the
+    // "⏹ Stopped." message below.
+    this.clearStreamingFlush();
+    run.stop();
     if (this.currentChatId) {
       this.sendResponse(this.currentChatId, '⏹ Stopped.', 'complete');
     }
@@ -1720,9 +2537,18 @@ export class AgentClient {
   }
 
   /**
-   * Handle change directory command
+   * Handle change directory command.
+   *
+   * Thin wrapper: `changeDirectory` does the work and owns the cd_result
+   * frame, so the self-config tool gets the same validation and the same
+   * server-side bookkeeping without a second implementation.
    */
   private handleCdCommand(newPath: string): void {
+    this.changeDirectory(newPath);
+  }
+
+  /** Resolve, validate, apply and announce a working-directory change. */
+  private changeDirectory(newPath: string): { success: boolean; path?: string; error?: string } {
     const resolved = path.resolve(this.workingDirectory, newPath);
 
     try {
@@ -1734,11 +2560,14 @@ export class AgentClient {
           timestamp: Date.now(),
           messageId: this.generateId(),
         });
-        return;
+        return { success: false, error: 'Directory not found' };
       }
 
       this.workingDirectory = resolved;
       this.config.setLastDirectory(resolved);
+      // A Codex thread owns its cwd and per-thread read server. Release it
+      // immediately instead of retaining both until another message arrives.
+      this.codex?.resetThread();
 
       this.send({
         type: 'cd_result',
@@ -1748,6 +2577,7 @@ export class AgentClient {
       });
 
       console.log(`Changed directory to: ${resolved}`);
+      return { success: true, path: resolved };
     } catch (error) {
       this.send({
         type: 'cd_result',
@@ -1755,6 +2585,7 @@ export class AgentClient {
         timestamp: Date.now(),
         messageId: this.generateId(),
       });
+      return { success: false, error: 'Failed to change directory' };
     }
   }
 
@@ -1782,6 +2613,19 @@ export class AgentClient {
    * WS messages. No-op if the cumulative text hasn't grown since last
    * flush — protects against firing on tool-result-only assistant events.
    */
+  /**
+   * Cancel a pending debounced streaming frame. Called on every terminal
+   * path (complete/cancel/timeout/supersede) — without this, a delta that
+   * arrived <80ms before run end fired its flush AFTER the complete
+   * message, repainting the closed streaming bubble with stale text.
+   */
+  private clearStreamingFlush(): void {
+    if (this.streamingFlushTimer) {
+      clearTimeout(this.streamingFlushTimer);
+      this.streamingFlushTimer = null;
+    }
+  }
+
   private scheduleStreamingFlush(): void {
     if (this.streamingFlushTimer) return;
     this.streamingFlushTimer = setTimeout(() => {
@@ -1930,13 +2774,16 @@ export class AgentClient {
    * Shutdown the agent
    */
   private shutdown(): void {
+    this.denyAllPendingApprovals('Agent is shutting down.');
     console.log('\nShutting down...');
 
     this.stopStreaming();
 
-    if (this.claudeProcess) {
-      this.claudeProcess.kill();
+    if (this.activeRun) {
+      this.activeRun.stop();
     }
+    // app-server outlives each turn, so it is ended here even when idle.
+    this.codex?.dispose();
 
     if (this.caffeinateProcess) {
       this.caffeinateProcess.kill();
@@ -2036,7 +2883,7 @@ export class AgentClient {
     if (!creds) return; // not reachable / network — local claude may be authed
     if (!creds.hasCredentials) {
       if (creds.expired) {
-        console.log("Your VibeKit account's Claude sign-in has expired — reconnect Claude in the app (Profile → Connect Claude). Falling back to this machine's local `claude`.\n");
+        console.log("Your VibeKit account's Claude sign-in needs reconnecting. In the app open Profile > Bring your own > Claude. Falling back to this machine's local `claude`.\n");
       }
       return;
     }
@@ -2100,9 +2947,14 @@ export class AgentClient {
       this.applyClaudeCredentials(creds);
       resynced = true;
     }
+    // The un-resynced message leads with the in-app fix on purpose. Whoever
+    // reads this is driving the agent REMOTELY, so the shell command is the
+    // one instruction they may be unable to follow; signing in from the app
+    // writes the credential to their account and this handler picks it up on
+    // the next message with no shell access at all.
     const msg = resynced
       ? "Re-synced your Claude sign-in from your VibeKit account. Please resend your last message."
-      : "Claude isn't signed in on the agent machine. Connect Claude in your VibeKit account (Profile → Connect Claude), or run `claude setup-token` on that machine, then resend.";
+      : "Claude isn't signed in for this agent. In the VibeKit app open Profile > Bring your own > Claude and sign in, then resend. No terminal needed. (On the machine itself, `claude setup-token` also works.)";
     this.sendResponse(chatId, msg, 'complete');
   }
 }
