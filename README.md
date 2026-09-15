@@ -22,9 +22,9 @@ npm install -g vibekit-agent
    ```bash
    npx vibekit-agent link
    ```
-   Enter the code when prompted.
+   Enter the code when prompted, then press Enter to start the agent right away. For Codex, run `npx vibekit-agent link --engine codex`.
 
-3. **Start the agent:**
+3. **Starting it later:**
    ```bash
    npx vibekit-agent start
    ```

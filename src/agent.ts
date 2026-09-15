@@ -373,7 +373,8 @@ export class AgentClient {
   /**
    * Link this computer to an iOS or Telegram account
    */
-  async link(): Promise<void> {
+  async link(requestedEngine?: Engine): Promise<void> {
+    let startNow = false;
     console.log('Connecting to VibeKit...\n');
 
     // Request a link from the server
@@ -446,29 +447,56 @@ export class AgentClient {
       // linked before Codex support, which must stay on Claude (start() pins
       // those). A re-link keeps whatever engine was already chosen, and a
       // re-link of a machine linked before Codex support stays on Claude.
-      const engine: Engine = this.config.getEngine()
+      // `link --engine` (the command the app shows for Codex) wins over both.
+      const engine: Engine = requestedEngine
+        ?? this.config.getEngine()
         ?? (wasLinked ? 'claude' : findClaudeBinary() ? 'claude' : findCodexBinary(() => {}) ? 'codex' : 'claude');
-      this.config.setEngine(engine);
+      const clearedModel = this.config.setEngine(engine);
 
       console.log('\nLinked successfully!');
       console.log('');
       if (engine === 'codex') {
-        console.log('This computer will run Codex (Claude Code was not found here).');
+        console.log(requestedEngine ? 'This computer will run Codex.' : 'This computer will run Codex (Claude Code was not found here).');
         console.log('Make sure Codex is logged in on this computer: codex login');
       } else {
         console.log('Tip: connect Claude in the VibeKit app (Profile → Connect Claude)');
         console.log('and the agent signs Claude in automatically — no setup-token needed.');
       }
+      if (clearedModel) console.log(`Cleared the model setting "${clearedModel}": it was for the other coding agent.`);
       console.log('');
-      console.log('Start the agent with:');
-      console.log('  npx vibekit-agent start');
-      console.log('To switch coding agents later: npx vibekit-agent start --engine claude (or codex)');
-      console.log('');
+
+      // One command instead of two. Pairing and then separately starting is
+      // where most people who generated a code never connected a computer
+      // (51 codes, 4 linked, 2026-08-01). Asked only at a terminal; Enter
+      // alone means yes, and "n" leaves the old two-step path intact.
+      if (process.stdin.isTTY && await this.askYesNo(`Start the agent now in ${process.cwd()}? (Y/n) `)) {
+        startNow = true;
+      } else {
+        console.log('Start the agent with:');
+        console.log('  npx vibekit-agent start');
+        console.log('To switch coding agents later: npx vibekit-agent start --engine claude (or codex)');
+        console.log('');
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.error('Link failed:', message);
       process.exit(1);
     }
+    // Outside the try: a start failure is not a link failure, and start()
+    // never returns while the agent runs.
+    if (startNow) {
+      console.log('');
+      await this.start(process.cwd());
+    }
+  }
+
+  /** One yes/no question at the terminal. Enter alone means yes. */
+  private async askYesNo(question: string): Promise<boolean> {
+    const readline = await import('readline');
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const answer = await new Promise<string>((resolve) => rl.question(question, resolve));
+    rl.close();
+    return !/^n/i.test(answer.trim());
   }
 
   /**
@@ -1693,11 +1721,17 @@ export class AgentClient {
         // DB blip during auth wiped the token and pm2 crash-looped
         // "No token found" 43k times (2026-08-01).
         const payload = (message.payload as { message: string; code?: string }) || { message: 'unknown' };
-        console.error('Authentication failed:', payload.message);
         if (payload.code === 'invalid_token') {
-          console.error('This machine\'s pairing is no longer valid. Run "vibekit-agent link" with a fresh code from the app.');
+          // The designed revocation path, not a failure: the machine was
+          // unlinked in the app (the only way a pairing ends), or its row
+          // was replaced. Said on stdout. Supervisors treat stderr as
+          // errors, and our own box's pm2 error log feeds the admin Remote
+          // Errors panel, where a deliberate unlink showed up as a server
+          // error (2026-09-15).
+          console.log('This machine was unlinked from VibeKit, so its pairing is no longer valid. Run "vibekit-agent link" with a fresh code from the app.');
           this.config.clear();
         } else {
+          console.error('Authentication failed:', payload.message);
           console.error('Keeping the stored pairing — this looks like a temporary server problem. Retrying shortly...');
           // Don't exit: schedule a normal reconnect like a dropped socket.
           this.scheduleReconnect();

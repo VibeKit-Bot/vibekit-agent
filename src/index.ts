@@ -39,9 +39,14 @@ const PAIRING_POLL_MS = 10_000;
  * the moment `vibekit-agent link` writes the pairing, with no pm2 command to run.
  */
 async function waitForPairing(): Promise<Config> {
-  console.error('No token found. Run "vibekit-agent link" first.');
-  if (process.stdout.isTTY) process.exit(1);
-  console.error('Waiting for a pairing — this agent starts on its own once you link it.');
+  if (process.stdout.isTTY) {
+    console.error('No token found. Run "vibekit-agent link" first.');
+    process.exit(1);
+  }
+  // Under a supervisor, an unpaired agent waiting is a normal state (it is
+  // what an unlink from the app leaves behind), so it goes to stdout. On
+  // stderr it read as an error to pm2 and to the admin Remote Errors panel.
+  console.log('Not linked yet. Waiting for a pairing: this agent starts on its own once you run "vibekit-agent link".');
   for (;;) {
     await new Promise((resolve) => setTimeout(resolve, PAIRING_POLL_MS));
     const linked = new Config();
@@ -55,10 +60,16 @@ async function waitForPairing(): Promise<Config> {
 program
   .command('link')
   .description('Link this computer to your iPhone or Telegram account')
-  .action(async () => {
+  .option('--engine <engine>', 'Coding agent to run: claude or codex (remembered for next time)')
+  .action(async (options) => {
+    const engine = options.engine as string | undefined;
+    if (engine !== undefined && !(ENGINES as readonly string[]).includes(engine)) {
+      console.error(`Unknown engine "${engine}". Use: ${ENGINES.join(' or ')}.`);
+      process.exit(1);
+    }
     const config = new Config();
     const agent = new AgentClient(config);
-    await agent.link();
+    await agent.link(engine as Engine | undefined);
   });
 
 program
