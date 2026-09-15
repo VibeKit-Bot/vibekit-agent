@@ -22,7 +22,7 @@ npm install -g vibekit-agent
    ```bash
    npx vibekit-agent link
    ```
-   Enter the code when prompted, then press Enter to start the agent right away. For Codex, run `npx vibekit-agent link --engine codex`.
+   Enter the code when prompted, then press Enter to start the agent right away. For Codex, run `npx vibekit-agent link codex`.
 
 3. **Starting it later:**
    ```bash
@@ -33,11 +33,11 @@ npm install -g vibekit-agent
 
 ## Claude Code or Codex
 
-`link` picks the coding agent for this computer: Claude Code if it is installed, otherwise Codex. To choose explicitly (remembered for next time):
+Name the coding agent when you link: `npx vibekit-agent link claude` or `npx vibekit-agent link codex`. Without one, `link` picks Claude Code if it is installed, otherwise Codex. To switch later (remembered for next time):
 
 ```bash
-npx vibekit-agent start --engine codex
-npx vibekit-agent start --engine claude
+npx vibekit-agent start codex
+npx vibekit-agent start claude
 ```
 
 Codex runs on your own ChatGPT account. Install it and log in on the computer first:
@@ -82,7 +82,8 @@ Once connected, use these commands in the iOS app or bot:
 | `vibekit-agent link` | Link this computer to your iPhone or Telegram account |
 | `vibekit-agent start` | Start the remote agent |
 | `vibekit-agent start -d /path/to/project` | Start in a specific directory |
-| `vibekit-agent start --engine codex` | Switch this computer to Codex (or `claude`) |
+| `vibekit-agent link codex` | Link this computer and run Codex on it (or `link claude`) |
+| `vibekit-agent start codex` | Switch this computer to Codex (or `start claude`) |
 | `vibekit-agent status` | Show connection status |
 | `vibekit-agent logout` | Remove stored credentials |
 | `vibekit-agent config` | View current configuration |

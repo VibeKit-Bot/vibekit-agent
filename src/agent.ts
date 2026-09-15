@@ -447,7 +447,7 @@ export class AgentClient {
       // linked before Codex support, which must stay on Claude (start() pins
       // those). A re-link keeps whatever engine was already chosen, and a
       // re-link of a machine linked before Codex support stays on Claude.
-      // `link --engine` (the command the app shows for Codex) wins over both.
+      // `link codex` / `link claude` (the command the app shows) wins over both.
       const engine: Engine = requestedEngine
         ?? this.config.getEngine()
         ?? (wasLinked ? 'claude' : findClaudeBinary() ? 'claude' : findCodexBinary(() => {}) ? 'codex' : 'claude');
@@ -474,7 +474,7 @@ export class AgentClient {
       } else {
         console.log('Start the agent with:');
         console.log('  npx vibekit-agent start');
-        console.log('To switch coding agents later: npx vibekit-agent start --engine claude (or codex)');
+        console.log('To switch coding agents later: npx vibekit-agent start codex (or start claude)');
         console.log('');
       }
     } catch (error) {

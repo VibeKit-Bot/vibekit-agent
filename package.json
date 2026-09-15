@@ -1,6 +1,6 @@
 {
   "name": "vibekit-agent",
-  "version": "1.6.1",
+  "version": "1.6.2",
   "description": "Control your local Claude Code or Codex agent from VibeKit Remote",
   "main": "dist/index.js",
   "bin": {

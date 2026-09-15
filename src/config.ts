@@ -28,9 +28,21 @@ const MODEL_ID_RE = /^claude-[a-z0-9][a-z0-9.-]{2,63}$/i;
 /** Codex model slugs (gpt-6-astra, gpt-5.6-sol, ...). The agent also checks the live model/list when it has one. */
 const CODEX_MODEL_RE = /^[a-z0-9][a-z0-9._-]{1,63}$/i;
 
-/** Which coding agent this machine runs. Chosen at `link`, changed with `start --engine`. */
+/** Which coding agent this machine runs. Chosen at `link` (`link codex`), changed with `start codex` / `start claude`. */
 export type Engine = 'claude' | 'codex';
 export const ENGINES: readonly Engine[] = ['claude', 'codex'];
+
+/**
+ * The coding agent a user named: `link codex`, `start claude-code`, or the
+ * older `--engine` flag. Accepts the product names the way people type them.
+ * null when the word names neither.
+ */
+export function parseEngine(value: string): Engine | null {
+  const v = value.trim().toLowerCase().replace(/[\s_-]+/g, '');
+  if (v === 'codex' || v === 'openaicodex') return 'codex';
+  if (v === 'claude' || v === 'claudecode') return 'claude';
+  return null;
+}
 
 export function isValidModel(model: string, engine: Engine = 'claude'): boolean {
   const m = model.trim();

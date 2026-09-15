@@ -5,7 +5,7 @@ import * as readline from 'readline';
 import * as fs from 'fs';
 import * as path from 'path';
 import { AgentClient } from './agent';
-import { Config, DEFAULT_ALLOWED_TOOLS, ENGINES, Engine, codexToolListProblem } from './config';
+import { Config, DEFAULT_ALLOWED_TOOLS, Engine, codexToolListProblem, parseEngine } from './config';
 
 const program = new Command();
 
@@ -57,38 +57,46 @@ async function waitForPairing(): Promise<Config> {
   }
 }
 
+/**
+ * The coding agent named after the command (`link codex`, `start claude`), or
+ * with the `--engine` flag that 1.6.0 and 1.6.1 documented. The word reads the
+ * way people say it; the flag keeps instructions already out there working.
+ */
+function engineFromArgs(word: string | undefined, flag: string | undefined): Engine | undefined {
+  const raw = word ?? flag;
+  if (raw === undefined) return undefined;
+  const engine = parseEngine(raw);
+  if (!engine) {
+    console.error(`Unknown coding agent "${raw}". Use claude or codex, for example: vibekit-agent link codex`);
+    process.exit(1);
+  }
+  return engine;
+}
+
 program
-  .command('link')
-  .description('Link this computer to your iPhone or Telegram account')
-  .option('--engine <engine>', 'Coding agent to run: claude or codex (remembered for next time)')
-  .action(async (options) => {
-    const engine = options.engine as string | undefined;
-    if (engine !== undefined && !(ENGINES as readonly string[]).includes(engine)) {
-      console.error(`Unknown engine "${engine}". Use: ${ENGINES.join(' or ')}.`);
-      process.exit(1);
-    }
+  .command('link [agent]')
+  .description('Link this computer to your iPhone or Telegram account. Add claude or codex to pick the coding agent.')
+  .option('--engine <engine>', 'Same as the agent argument (older form)')
+  .action(async (agentWord: string | undefined, options) => {
+    const engine = engineFromArgs(agentWord, options.engine);
     const config = new Config();
     const agent = new AgentClient(config);
-    await agent.link(engine as Engine | undefined);
+    await agent.link(engine);
   });
 
 program
-  .command('start')
-  .description('Start the remote agent')
+  .command('start [agent]')
+  .description('Start the remote agent. Add claude or codex to switch the coding agent (remembered).')
   .option('-d, --directory <path>', 'Working directory', process.cwd())
   .option('--auto', 'Auto mode - use environment variables for config (for Docker containers)')
   .option('--ws-url <url>', 'WebSocket URL (auto mode)')
   .option('--token <token>', 'Authentication token (auto mode)')
   .option('--credentials-file <path>', 'Claude credentials file path (auto mode)')
-  .option('--engine <engine>', 'Coding agent to run: claude or codex (remembered for next time)')
-  .action(async (options) => {
+  .option('--engine <engine>', 'Same as the agent argument (older form)')
+  .action(async (agentWord: string | undefined, options) => {
     let config: Config;
 
-    const engine = options.engine as string | undefined;
-    if (engine !== undefined && !(ENGINES as readonly string[]).includes(engine)) {
-      console.error(`Unknown engine "${engine}". Use: ${ENGINES.join(' or ')}.`);
-      process.exit(1);
-    }
+    const engine = engineFromArgs(agentWord, options.engine);
     if (options.auto && engine === 'codex') {
       console.error('Auto mode runs Claude Code only.');
       process.exit(1);
@@ -112,7 +120,7 @@ program
 
       if (!config.hasToken()) config = await waitForPairing();
       if (engine) {
-        const cleared = config.setEngine(engine as Engine);
+        const cleared = config.setEngine(engine);
         if (cleared) console.log(`Cleared the model setting "${cleared}": it was for the other coding agent.`);
       }
     }
