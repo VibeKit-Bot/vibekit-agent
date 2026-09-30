@@ -395,7 +395,10 @@ export class CodexEngine {
     const existingThread = generation === this.conversationGeneration ? this.threadId : null;
     if (existingThread && this.threadNeedsResume) {
       try {
-        await this.request('thread/resume', { threadId: existingThread, excludeTurns: true, ...shared });
+        // No `excludeTurns`: Codex before 0.153.0 gates it behind
+        // experimentalApi and rejects the whole resume, which failed every
+        // message after an app-server restart (verified on 0.150.0).
+        await this.request('thread/resume', { threadId: existingThread, ...shared });
         if (generation === this.conversationGeneration && this.threadId === existingThread) {
           this.threadNeedsResume = false;
           this.threadAccess = req.access;
@@ -485,7 +488,7 @@ export class CodexEngine {
     });
     child.stdin?.on('error', () => { /* EPIPE after the child died; the exit handler reports it */ });
     child.on('error', (e) => this.onExit(child, `could not start ${this.binary} (${e.message})`));
-    child.on('exit', (code, signal) => this.onExit(child, `app-server exited (${signal || `code ${code}`})`));
+    child.on('exit', (code, signal) => this.onExit(child, `app-server exited (${signal || `code ${code}`})`, signal));
 
     try {
       await this.request('initialize', {
@@ -518,13 +521,18 @@ export class CodexEngine {
     });
   }
 
-  private onExit(child: ChildProcess, reason: string): void {
+  private onExit(child: ChildProcess, reason: string, signal?: NodeJS.Signals | null): void {
     if (this.child !== child) return;
     this.child = null;
     this.ready = false;
     CodexEngine.liveEngines.delete(this);
     const lastLine = this.stderrTail.trim().split('\n').pop() || '';
-    const detail = lastLine ? `${reason}: ${lastLine.slice(0, 200)}` : reason;
+    // Every kill of our own goes through dispose(), which this handler
+    // ignores, so a signal here came from outside the agent. Its stderr tail
+    // is whatever Codex last warned about, not why it stopped: a real user
+    // was told a "trusted project" notice with a temp path (2026-09-29).
+    if (signal && lastLine) console.log(`Codex app-server stopped by ${signal}; its last stderr line: ${lastLine.slice(0, 300)}`);
+    const detail = signal ? signal : lastLine ? `${reason}: ${lastLine.slice(0, 200)}` : reason;
     for (const [id, p] of this.pending) {
       if (p.timer) clearTimeout(p.timer);
       p.reject(new Error(detail));
@@ -533,7 +541,7 @@ export class CodexEngine {
     if (this.threadId) this.threadNeedsResume = true;
     this.retiredThreads.clear();
     const turn = this.turn;
-    if (turn) this.finishTurn(turn, { status: 'failed', text: turn.translator.text, toolCount: turn.translator.toolCount, error: { info: 'crashed', message: detail } });
+    if (turn) this.finishTurn(turn, { status: 'failed', text: turn.translator.text, toolCount: turn.translator.toolCount, error: { info: signal ? 'killed' : 'crashed', message: detail } });
   }
 
   private write(child: ChildProcess, message: Record<string, unknown>): void {
@@ -609,6 +617,9 @@ export class CodexEngine {
     // the completion notification so late text and tool cards cannot follow it.
     if (turn.stopRequested) return;
     for (const output of turn.translator.handle(method, params)) turn.hooks.output(output);
+    // Ending it as unauthorized disposes app-server, which stops Codex's own
+    // retries of a key OpenAI has already refused.
+    if (turn.translator.refused) this.finishTurn(turn, turn.translator.end({ status: 'failed' }));
   }
 
   private ownsApproval(child: ChildProcess, turn: Turn | null, params: any): turn is Turn {

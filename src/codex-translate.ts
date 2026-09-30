@@ -32,7 +32,7 @@ export type CodexOutput =
   | { kind: 'tool'; tool: ToolInvocation };
 
 export interface CodexError {
-  /** codexErrorInfo's variant name (`unauthorized`, `usageLimitExceeded`, ...), or one of ours: `notInstalled`, `startFailed`, `unsupported`, `crashed`. */
+  /** codexErrorInfo's variant name (`unauthorized`, `usageLimitExceeded`, ...), or one of ours: `notInstalled`, `startFailed`, `unsupported`, `crashed`, `killed` (a signal from outside the agent). */
   info: string;
   message: string;
 }
@@ -51,7 +51,7 @@ interface FileChange {
 }
 
 export const CODEX_NOT_LOGGED_IN =
-  "Codex isn't logged in on this computer. On that computer, run `codex login`, then send your message again.";
+  "Codex on this computer isn't signed in, or OpenAI refused its sign-in. On that computer, run `codex login`, then send your message again.";
 export const CODEX_NOT_INSTALLED =
   "Codex isn't installed on this computer. On that computer, run `npm i -g @openai/codex`, then send your message again.";
 
@@ -85,6 +85,21 @@ export function errorInfoKey(info: unknown): string {
     if (key) return key;
   }
   return 'other';
+}
+
+/**
+ * The error's info key, with a refused sign-in read as `unauthorized` in every
+ * shape Codex reports one. A rejected API key never says `unauthorized`: each
+ * retry carries `{responseStreamDisconnected: {httpStatusCode: 401}}` and the
+ * final error only `other` and "unexpected status 401" (Codex 0.150.0,
+ * reproduced 2026-09-29), so a real user got the raw OpenAI text.
+ */
+export function errorInfoFor(error: any): string {
+  const info = error?.codexErrorInfo;
+  const detail = info && typeof info === 'object' ? (Object.values(info)[0] as any) : null;
+  if (detail?.httpStatusCode === 401) return 'unauthorized';
+  if (/\bunexpected status 401\b/.test(`${error?.message ?? ''} ${error?.additionalDetails ?? ''}`)) return 'unauthorized';
+  return errorInfoKey(info);
 }
 
 function inRoughly(ms: number): string {
@@ -126,6 +141,8 @@ export function codexErrorReply(
       return `Could not start Codex on this computer: ${err.message.slice(0, 300)}`;
     case 'crashed':
       return `Codex stopped unexpectedly (${err.message.slice(0, 200)}). Send your message again.`;
+    case 'killed':
+      return `Something on this computer stopped Codex (${err.message.slice(0, 20)}) before it finished. Send your message again.`;
     default:
       return `Codex reported an error: ${(err.message || 'unknown error').slice(0, 300)}`;
   }
@@ -201,6 +218,8 @@ function mcpResultText(item: any): string {
 export class CodexTurnTranslator {
   text = '';
   toolCount = 0;
+  /** OpenAI rejected the API key while Codex was still retrying; the engine ends the turn on it. */
+  refused = false;
   private lastError: CodexError | null = null;
   /** agentMessage items that have streamed at least one delta, so their item/completed text is not appended twice. */
   private streamedItems = new Set<string>();
@@ -226,9 +245,18 @@ export class CodexTurnTranslator {
         return this.itemCompleted(params?.item);
       case 'error': {
         const e = params?.error || {};
-        // A transient failure Codex is already retrying: show it, keep the turn open.
-        if (params?.willRetry) return [{ kind: 'status', text: 'Retrying after a temporary Codex error...' }];
-        this.lastError = { info: errorInfoKey(e.codexErrorInfo), message: typeof e.message === 'string' ? e.message : '' };
+        const info = errorInfoFor(e);
+        if (params?.willRetry) {
+          // A rejected API key fails every retry the same way, and Codex spends
+          // ten of them before saying so (about two minutes for the user). Only
+          // that code: another 401 may be a ChatGPT token Codex can refresh.
+          if (!/\binvalid_api_key\b/.test(`${e.message ?? ''} ${e.additionalDetails ?? ''}`)) {
+            // A transient failure Codex is already retrying: show it, keep the turn open.
+            return [{ kind: 'status', text: 'Retrying after a temporary Codex error...' }];
+          }
+          this.refused = true;
+        }
+        this.lastError = { info, message: typeof e.message === 'string' ? e.message : '' };
         return [];
       }
       default:
@@ -266,7 +294,7 @@ export class CodexTurnTranslator {
     const status = turn?.status === 'completed' || turn?.status === 'interrupted' ? turn.status : 'failed';
     let error = this.lastError;
     if (status === 'failed' && !error && turn?.error) {
-      error = { info: errorInfoKey(turn.error.codexErrorInfo), message: typeof turn.error.message === 'string' ? turn.error.message : '' };
+      error = { info: errorInfoFor(turn.error), message: typeof turn.error.message === 'string' ? turn.error.message : '' };
     }
     return { status, text: this.text, toolCount: this.toolCount, error: status === 'completed' ? null : error };
   }

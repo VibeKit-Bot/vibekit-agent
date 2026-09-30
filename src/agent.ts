@@ -13,6 +13,7 @@ import {
 } from './config';
 import { CodexEngine, CODEX_TESTED_VERSION, McpServerSpec, VKCONFIG_SERVER, codexLoggedIn, findCodexBinary, isOlderVersion } from './codex-engine';
 import { CODEX_NOT_INSTALLED, CodexTurnEnd, codexErrorReply } from './codex-translate';
+import { localImageRefs, readImageForPhone } from './local-images';
 
 /** The phone's answer to anything we blocked on: a tool permission prompt, or
  *  a config change that would reduce safety. */
@@ -381,63 +382,7 @@ export class AgentClient {
     const serverUrl = process.env.VIBEKIT_SERVER || 'https://vibekit.bot';
 
     try {
-      // Generate a temporary link code request
-      console.log('To link your computer:');
-      console.log('');
-      console.log('iPhone: Open the VibeKit app, go to "Remote", and tap "Generate Link Code"');
-      console.log('Telegram: Open @the_vibe_kit_bot and send /remote');
-      console.log('Then copy the 6-character code and paste it here.');
-      console.log('');
-
-      // Wait for user to enter the code. Loop on local validation errors
-      // (wrong length, mistype) and on server-rejected codes so the user
-      // doesn't have to re-run the whole command after a typo.
-      const readline = await import('readline');
-      const rl = readline.createInterface({
-        input: process.stdin,
-        output: process.stdout,
-      });
-
-      const askCode = (): Promise<string> => new Promise((resolve) => {
-        rl.question('Enter the code from iOS or Telegram: ', (answer) => {
-          resolve(answer.trim().toUpperCase());
-        });
-      });
-
-      let result: { token: string; wsUrl: string } | null = null;
-      while (!result) {
-        const code = await askCode();
-        if (!code) {
-          console.log('Empty input — try again or press Ctrl+C to cancel.');
-          continue;
-        }
-        if (code.length !== 6) {
-          console.log(`Code is 6 characters (got ${code.length}). Try again or press Ctrl+C to cancel.`);
-          continue;
-        }
-
-        console.log('\nValidating code...');
-        let response: Response;
-        try {
-          response = await fetch(`${serverUrl}/api/agent/link`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ code }),
-          });
-        } catch (e: any) {
-          console.log(`Network error: ${e?.message || e}. Try again or press Ctrl+C to cancel.\n`);
-          continue;
-        }
-
-        if (!response.ok) {
-          const errorData = (await response.json().catch(() => ({ error: 'Unknown error' }))) as { error?: string };
-          console.log(`${errorData.error || 'Invalid or expired code'}. Generate a fresh code in iOS / Telegram and try again, or press Ctrl+C to cancel.\n`);
-          continue;
-        }
-
-        result = (await response.json()) as { token: string; wsUrl: string };
-      }
-      rl.close();
+      const result = await this.pairThisComputer(serverUrl, requestedEngine);
 
       const wasLinked = this.config.hasToken();
       this.config.setCredentials(result.token, result.wsUrl);
@@ -497,6 +442,234 @@ export class AgentClient {
     const answer = await new Promise<string>((resolve) => rl.question(question, resolve));
     rl.close();
     return !/^n/i.test(answer.trim());
+  }
+
+  /**
+   * Pair by QR (current app) or by a typed code (older apps), whichever lands
+   * first. The server opens a pairing session this terminal prints as a QR
+   * plus a short code, and the terminal polls for the phone's approval. At a
+   * terminal the old prompt stays open beside it, so someone on an app build
+   * that cannot scan still pairs the way they always did. If the server cannot
+   * open a session (older or self-hosted server, network trouble), only the
+   * typed code is offered, exactly as before 1.7.0.
+   */
+  private async pairThisComputer(serverUrl: string, requestedEngine?: Engine): Promise<{ token: string; wsUrl: string }> {
+    const interactive = !!process.stdin.isTTY;
+    let session = await this.startPairSession(serverUrl, requestedEngine);
+    if (session) {
+      this.printPairSession(session);
+    } else {
+      // Same words as the app's buttons (check:pairsessions pins them). While
+      // the server's QR is off, the app's second step is this code.
+      console.log('To link this computer, open the VibeKit app and go to Remote.');
+      console.log('Tap "Connect a computer", then Next, and type the code it shows here.');
+      console.log('Older app? Tap "Pair an agent" instead.');
+      console.log('');
+      if (!interactive) throw new Error('Could not start a pairing session, and there is no terminal to type a code into.');
+    }
+    const prompt = session ? 'Older VibeKit app? Type the code it shows here: ' : 'Enter the code from the VibeKit app: ';
+
+    const readline = await import('readline');
+    type Outcome = { token: string; wsUrl: string; account?: string | null; session?: { id: string; secret: string } };
+    const outcome = await new Promise<Outcome>((resolve, reject) => {
+      let done = false;
+      let timer: NodeJS.Timeout | null = null;
+      let rl: import('readline').Interface | null = null;
+      const settle = () => {
+        done = true;
+        if (timer) clearTimeout(timer);
+        rl?.close();
+      };
+      const finish = (result: Outcome) => { if (!done) { settle(); resolve(result); } };
+      const fail = (err: Error) => { if (!done) { settle(); reject(err); } };
+
+      if (interactive) {
+        rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+        // readline swallows Ctrl+C. Without this the prompt closed but the poll
+        // below kept the process alive, and a late approval still linked the
+        // computer the person had just cancelled.
+        rl.on('SIGINT', () => {
+          settle();
+          console.log('\nCancelled. This computer was not linked.');
+          process.exit(130);
+        });
+        const ask = () => {
+          if (done || !rl) return;
+          rl.question(prompt, async (answer) => {
+            if (done) return;
+            const code = answer.trim().toUpperCase();
+            // Enter alone just keeps waiting for the phone.
+            if (!code) { ask(); return; }
+            if (code.length !== 6) {
+              console.log(`Code is 6 characters (got ${code.length}). Try again or press Ctrl+C to cancel.`);
+              ask();
+              return;
+            }
+            console.log('\nValidating code...');
+            let response: Response;
+            try {
+              response = await this.fetchWithTimeout(`${serverUrl}/api/agent/link`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ code }),
+              });
+            } catch (e: any) {
+              console.log(`Network error: ${e?.message || e}. Try again or press Ctrl+C to cancel.\n`);
+              ask();
+              return;
+            }
+            if (!response.ok) {
+              const errorData = (await response.json().catch(() => ({ error: 'Unknown error' }))) as { error?: string };
+              console.log(`${errorData.error || 'Invalid or expired code'}. Get a fresh code in the VibeKit app and try again, or press Ctrl+C to cancel.\n`);
+              ask();
+              return;
+            }
+            finish((await response.json()) as { token: string; wsUrl: string });
+          });
+        };
+        ask();
+      }
+
+      const poll = async () => {
+        if (done || !session) return;
+        const current = session;
+        let next = 2000;
+        try {
+          const r = await this.claimPairSession(serverUrl, current);
+          if (done) return;
+          if (r.kind === 'paired') {
+            finish({ token: r.token, wsUrl: r.wsUrl, account: r.account, session: { id: current.id, secret: current.secret } });
+            return;
+          }
+          if (r.kind === 'stop') {
+            console.log(`\n${r.message}`);
+            if (!interactive) fail(new Error(r.message));
+            else process.stdout.write(prompt);
+            return;
+          }
+          if (r.kind === 'renew') {
+            const fresh = await this.startPairSession(serverUrl, requestedEngine);
+            if (done) return;
+            if (fresh) {
+              console.log(`\n${r.message}`);
+              session = fresh;
+              this.printPairSession(fresh);
+              if (interactive) process.stdout.write(prompt);
+            } else {
+              next = 10_000;
+            }
+          }
+        } catch {
+          next = 5000; // network trouble or a rate limit: keep waiting
+        }
+        if (!done) timer = setTimeout(poll, next);
+      };
+      if (session) timer = setTimeout(poll, 2000);
+    });
+
+    // Anyone who can see a QR (a screen share, a shoulder) can approve it, and
+    // approving binds this computer to THEIR account. So name the account that
+    // approved and, at a terminal, let the person here refuse before anything
+    // is saved; a refusal deletes the agent the claim created.
+    if (outcome.session) {
+      const who = outcome.account || 'a VibeKit account';
+      console.log(`\nApproved on a phone signed in to ${who}.`);
+      if (interactive && !(await this.askYesNo(`Link this computer to ${who}? (Y/n) `))) {
+        await this.rejectPairSession(serverUrl, outcome.session).catch(() => {});
+        throw new Error('Not linked. Run the command again and approve it from your own phone.');
+      }
+    }
+    return { token: outcome.token, wsUrl: outcome.wsUrl };
+  }
+
+  private async rejectPairSession(serverUrl: string, session: { id: string; secret: string }): Promise<void> {
+    await this.fetchWithTimeout(`${serverUrl}/api/agent/pair-sessions/${encodeURIComponent(session.id)}/reject`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ secret: session.secret }),
+    });
+  }
+
+  private async startPairSession(serverUrl: string, requestedEngine?: Engine): Promise<{ id: string; secret: string; code: string; pairUrl: string } | null> {
+    try {
+      const res = await this.fetchWithTimeout(`${serverUrl}/api/agent/pair-sessions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          engine: requestedEngine ?? this.config.getEngine() ?? null,
+          hostname: os.hostname(),
+          platform: os.platform(),
+          agentVersion: AGENT_VERSION,
+        }),
+      });
+      if (!res.ok) return null;
+      const j = (await res.json()) as any;
+      if (typeof j?.sessionId !== 'string' || typeof j?.secret !== 'string' || typeof j?.pairUrl !== 'string') return null;
+      return { id: j.sessionId, secret: j.secret, code: String(j.code || ''), pairUrl: j.pairUrl };
+    } catch {
+      return null;
+    }
+  }
+
+  private async claimPairSession(
+    serverUrl: string,
+    session: { id: string; secret: string },
+  ): Promise<{ kind: 'paired'; token: string; wsUrl: string; account: string | null } | { kind: 'wait' } | { kind: 'renew'; message: string } | { kind: 'stop'; message: string }> {
+    // 30s, not 10: the claim mints the agent, and a response lost to an early
+    // timeout is recovered by the server replaying the same token anyway.
+    const res = await this.fetchWithTimeout(`${serverUrl}/api/agent/pair-sessions/${encodeURIComponent(session.id)}/claim`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ secret: session.secret }),
+    }, 30_000);
+    const j = (await res.json().catch(() => ({}))) as any;
+    if (res.status === 403) {
+      return { kind: 'stop', message: j?.error || "Your plan's computer limit is reached. Unlink a computer in the app or upgrade, then run this again." };
+    }
+    if (res.status === 404 || res.status === 409) return { kind: 'renew', message: 'That pairing code is no longer valid. Here is a new one.' };
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    if (j?.status === 'paired' && typeof j.token === 'string' && typeof j.wsUrl === 'string') {
+      return { kind: 'paired', token: j.token, wsUrl: j.wsUrl, account: typeof j.account === 'string' ? j.account : null };
+    }
+    if (j?.status === 'expired') return { kind: 'renew', message: 'The pairing code expired. Here is a new one.' };
+    if (j?.status === 'declined') return { kind: 'renew', message: 'Pairing was declined on the phone. Here is a new code.' };
+    return { kind: 'wait' };
+  }
+
+  private printPairSession(session: { code: string; pairUrl: string }): void {
+    const qr = this.renderQr(session.pairUrl);
+    console.log('');
+    console.log('Scan this with your iPhone camera, or tap "Open camera" in the VibeKit app:');
+    console.log('');
+    console.log(qr ? qr.split('\n').map((line) => `  ${line}`).join('\n') : `  ${session.pairUrl}`);
+    console.log('');
+    if (session.code) console.log(`Can't scan? Tap "Type the code instead" and enter ${session.code}`);
+    console.log('A new code appears on its own if this one expires. Press Ctrl+C to cancel.');
+    console.log('');
+    console.log('Waiting for your phone...');
+  }
+
+  /** Half-block QR sized for a terminal. Null if the renderer is missing, so the URL prints instead. */
+  private renderQr(text: string): string | null {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const qrcode = require('qrcode-terminal') as { generate(t: string, o: { small?: boolean }, cb: (q: string) => void): void };
+      let out: string | null = null;
+      qrcode.generate(text, { small: true }, (q) => { out = q; });
+      return out;
+    } catch {
+      return null;
+    }
+  }
+
+  private async fetchWithTimeout(url: string, init: RequestInit, ms = 10_000): Promise<Response> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), ms);
+    try {
+      return await fetch(url, { ...init, signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /**
@@ -1696,7 +1869,7 @@ export class AgentClient {
           console.log('Authenticated successfully');
         }
         console.log('');
-        console.log('Ready! Send messages from the VibeKit iOS app in "Remote" or via @the_vibe_kit_bot on Telegram.');
+        console.log('Ready! Send messages from the Remote tab in the VibeKit app.');
         console.log('Press Ctrl+C to stop.');
         console.log('');
         this.sendStatus('idle');
@@ -1939,8 +2112,7 @@ export class AgentClient {
     // Codex gets images as real inputs (localImage), on top of the path in the prompt.
     const imagePaths: string[] = [];
     const attachmentInfo = attachments?.length ? ` with ${attachments.length} attachment(s)` : '';
-    const source = chatId < 0 ? 'iOS' : 'Telegram';
-    console.log(`\nReceived from ${source}: ${text || '(no text)'}${attachmentInfo}`);
+    console.log(`\nReceived: ${text || '(no text)'}${attachmentInfo}`);
 
     // Process attachments if present
     if (attachments && attachments.length > 0) {
@@ -2060,7 +2232,8 @@ export class AgentClient {
     if (this.currentChatId && this.currentTelegramId) {
       const narration = end.text.trim();
       if (end.status === 'completed') {
-        this.sendResponse(this.currentChatId, narration || this.noReplyFallback(0, end.toolCount), 'complete');
+        const reply = this.sendLinkedImages(this.currentChatId, narration);
+        this.sendResponse(this.currentChatId, reply || this.noReplyFallback(0, end.toolCount), 'complete');
       } else {
         // A normal `complete` reply, never `status: 'error'`: iOS rewrites the
         // text of SSE error events with Claude-specific help, on every build
@@ -2072,6 +2245,38 @@ export class AgentClient {
       }
     }
     this.activeRun = null;
+  }
+
+  /**
+   * Send the local images a reply links to (local-images.ts) ahead of the
+   * reply, which iOS needs to attach them to it, and return the reply with
+   * each sent link reduced to its caption. The user's own attachments are
+   * never echoed back, the same rule as Claude's assistant image blocks.
+   */
+  private sendLinkedImages(chatId: number, text: string): string {
+    const canonicalPath = (target: string): string => {
+      try { return fs.realpathSync(target); } catch { return path.resolve(target); }
+    };
+    const attachmentsDir = canonicalPath(path.join(this.workingDirectory, '.vibekit-attachments')) + path.sep;
+    const sent = new Set<string>();
+    let reply = text;
+    for (const ref of localImageRefs(text)) {
+      const imagePath = canonicalPath(ref.path);
+      if (imagePath.startsWith(attachmentsDir)) continue;
+      if (!sent.has(imagePath)) {
+        const image = readImageForPhone(ref.path);
+        if (!image) continue;
+        this.send({
+          type: 'image_chunk',
+          payload: { chatId, mimeType: image.mimeType, data: image.data, source: 'assistant' },
+          timestamp: Date.now(),
+          messageId: this.generateId(),
+        });
+        sent.add(imagePath);
+      }
+      reply = reply.replace(ref.markdown, () => ref.alt); // a function, so `$&` in a caption stays literal
+    }
+    return reply.trim();
   }
 
   /** Per-thread MCP tools. Read-only mode gets filesystem readers because its native shell is disabled. */
@@ -2679,7 +2884,7 @@ export class AgentClient {
    */
   private sendResponse(chatId: number, text: string, status: 'streaming' | 'complete'): void {
     if (!this.currentTelegramId) {
-      console.error('Cannot send response: no telegram ID');
+      console.error('Cannot send response: the message had no owner id');
       return;
     }
 

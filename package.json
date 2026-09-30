@@ -1,6 +1,6 @@
 {
   "name": "vibekit-agent",
-  "version": "1.6.2",
+  "version": "1.7.2",
   "description": "Control your local Claude Code or Codex agent from VibeKit Remote",
   "main": "dist/index.js",
   "bin": {
@@ -17,7 +17,7 @@
     "claude-code",
     "codex",
     "openai",
-    "telegram",
+    "ios",
     "vibekit",
     "remote"
   ],
@@ -25,6 +25,7 @@
   "license": "MIT",
   "dependencies": {
     "commander": "^12.1.0",
+    "qrcode-terminal": "^0.12.0",
     "ws": "^8.18.0"
   },
   "devDependencies": {

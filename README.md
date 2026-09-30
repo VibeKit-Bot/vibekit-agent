@@ -1,6 +1,6 @@
 # vibekit-agent
 
-Control Claude Code or Codex on your own computer from iPhone or Telegram. Ship code from your phone.
+Control Claude Code or Codex on your own computer from the VibeKit iPhone app. Ship code from your phone.
 
 This is VibeKit's **local bridge mode**. Your code runs on **your machine**, not in VibeKit cloud.
 
@@ -14,22 +14,20 @@ npm install -g vibekit-agent
 
 ## Quick Start
 
-1. **Get a link code from iPhone or Telegram:**
-   - Open the VibeKit iOS app and go to `Remote`, or open [@the_vibe_kit_bot](https://t.me/the_vibe_kit_bot)
-   - Tap or send `/remote` to get your link code
-
-2. **Link your computer:**
+1. **Link your computer:**
    ```bash
    npx vibekit-agent link
    ```
-   Enter the code when prompted, then press Enter to start the agent right away. For Codex, run `npx vibekit-agent link codex`.
+   In the VibeKit app go to `Remote` and tap **Connect a computer**. The app walks the same steps as the terminal: when the terminal prints a QR code, tap **Open camera** and scan it (your iPhone camera works too); when it asks for a code, the app shows one to type. Then press Enter to start the agent right away. Can't scan? Tap **Type the code instead** and enter the code printed under the QR. For Codex, run `npx vibekit-agent link codex`.
+
+2. **Older VibeKit app?** Tap **Pair an agent** in `Remote` and type the code it shows into the same terminal prompt.
 
 3. **Starting it later:**
    ```bash
    npx vibekit-agent start
    ```
 
-4. **Send messages from iPhone or Telegram** - they'll be executed by Claude Code or Codex on your machine.
+4. **Send messages from the Remote tab** - Claude Code or Codex runs them on your machine.
 
 ## Claude Code or Codex
 
@@ -50,7 +48,7 @@ codex login
 ## When to Use This
 
 Use `vibekit-agent` when you want:
-- iPhone first, then Telegram, to control Claude Code or Codex on your own laptop or desktop
+- to control Claude Code or Codex on your own laptop or desktop from your iPhone
 - to use your local Claude or ChatGPT sign-in instead of VibeKit cloud execution
 - a remote-control bridge for local development
 
@@ -65,21 +63,11 @@ Do **not** use it if you just want VibeKit-hosted tasks or deployments. For that
 - **Conversation memory** - The agent remembers context within a session
 - **Ask before actions** - Approve or deny each command and edit from the app or the lock screen
 
-## Remote Commands
-
-Once connected, use these commands in the iOS app or bot:
-
-| Command | Description |
-|---------|-------------|
-| `/remote` | View status, new chat, disconnect |
-| `/stop` | Cancel running task |
-| `/status` | View connection status |
-
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `vibekit-agent link` | Link this computer to your iPhone or Telegram account |
+| `vibekit-agent link` | Link this computer to your VibeKit account |
 | `vibekit-agent start` | Start the remote agent |
 | `vibekit-agent start -d /path/to/project` | Start in a specific directory |
 | `vibekit-agent link codex` | Link this computer and run Codex on it (or `link claude`) |
@@ -116,8 +104,8 @@ For **Ask before actions**, Remote starts Codex with a clean policy profile that
 
 1. The agent runs on your local machine
 2. It connects to VibeKit's server via WebSocket
-3. When you send a message from the iOS app or Telegram, it's relayed to your local agent
-4. Claude Code or Codex executes the request and sends results back to the iOS app or Telegram
+3. When you send a message from the iOS app, it's relayed to your local agent
+4. Claude Code or Codex executes the request and sends the results back to the app
 
 ## Requirements
 
@@ -145,7 +133,6 @@ For **Ask before actions**, Remote starts Codex with a clean policy profile that
 ## Links
 
 - [VibeKit Website](https://vibekit.bot)
-- [Telegram Bot](https://t.me/the_vibe_kit_bot)
 - [GitHub](https://github.com/VibeKit-Bot/vibekit-agent)
 
 ## License

@@ -75,7 +75,7 @@ function engineFromArgs(word: string | undefined, flag: string | undefined): Eng
 
 program
   .command('link [agent]')
-  .description('Link this computer to your iPhone or Telegram account. Add claude or codex to pick the coding agent.')
+  .description('Link this computer to your VibeKit account. Add claude or codex to pick the coding agent.')
   .option('--engine <engine>', 'Same as the agent argument (older form)')
   .action(async (agentWord: string | undefined, options) => {
     const engine = engineFromArgs(agentWord, options.engine);
@@ -137,7 +137,7 @@ program
 
     if (!config.hasToken()) {
       console.log('Status: Not linked');
-      console.log('Run "vibekit-agent link" to connect to iOS or Telegram.');
+      console.log('Run "vibekit-agent link" to connect it to the VibeKit app.');
       return;
     }
 
