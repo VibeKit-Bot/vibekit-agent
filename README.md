@@ -62,6 +62,7 @@ Do **not** use it if you just want VibeKit-hosted tasks or deployments. For that
 - **Document uploads** - Share files for the agent to work with
 - **Conversation memory** - The agent remembers context within a session
 - **Ask before actions** - Approve or deny each command and edit from the app or the lock screen
+- **Continue a desk session** - Pick up a Claude Code session you started in the terminal on this computer from the app (1.8.0+). It is a handoff, not a mirror: reopen it at the desk with `claude --resume` to see what you did from your phone
 
 ## Commands
 

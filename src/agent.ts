@@ -14,6 +14,7 @@ import {
 import { CodexEngine, CODEX_TESTED_VERSION, McpServerSpec, VKCONFIG_SERVER, codexLoggedIn, findCodexBinary, isOlderVersion } from './codex-engine';
 import { CODEX_NOT_INSTALLED, CodexTurnEnd, codexErrorReply } from './codex-translate';
 import { localImageRefs, readImageForPhone } from './local-images';
+import { listClaudeSessions, claudeSessionFile, recentClaudeTurns } from './claude-sessions';
 
 /** The phone's answer to anything we blocked on: a tool permission prompt, or
  *  a config change that would reduce safety. */
@@ -1932,6 +1933,14 @@ export class AgentClient {
         this.handleNewConversation();
         break;
 
+      case 'list_sessions':
+        this.handleListSessions((message.payload as { requestId?: string }) || {});
+        break;
+
+      case 'resume_session':
+        this.handleResumeSession((message.payload as { requestId?: string; sessionId?: string }) || {});
+        break;
+
       case 'cancel':
         // Explicit user Stop from iOS/Telegram. Before this existed the app's
         // Stop button was client-side only — the Claude run kept going on the
@@ -2362,6 +2371,48 @@ export class AgentClient {
     this.currentSessionId = null;
     this.codex?.resetThread();
     console.log('Conversation reset - next message will start fresh');
+  }
+
+  /**
+   * The Claude sessions saved for the current folder, for the phone's "Continue
+   * a session from this computer" list (claude-sessions.ts). Codex threads are
+   * not listed yet; the reply says which engine is active so the phone can say so.
+   */
+  private handleListSessions(payload: { requestId?: string }): void {
+    let sessions: ReturnType<typeof listClaudeSessions> = [];
+    if (this.engine === 'claude') {
+      try { sessions = listClaudeSessions(this.workingDirectory); } catch (e: any) { console.log(`[Agent] Listing sessions failed: ${e?.message || e}`); }
+    }
+    this.send({
+      type: 'sessions_list',
+      payload: { requestId: payload.requestId, engine: this.engine, cwd: this.workingDirectory, currentSessionId: this.currentSessionId, sessions },
+      timestamp: Date.now(),
+      messageId: this.generateId(),
+    });
+  }
+
+  /**
+   * Point the next message at a session from this folder: the same --resume
+   * every message already uses, with an id the person picked. Refused while a
+   * run is in flight, so a turn never changes session halfway.
+   */
+  private handleResumeSession(payload: { requestId?: string; sessionId?: string }): void {
+    const reply = (body: Record<string, unknown>) => this.send({
+      type: 'session_resumed',
+      payload: { requestId: payload.requestId, ...body },
+      timestamp: Date.now(),
+      messageId: this.generateId(),
+    });
+    if (this.engine !== 'claude') return reply({ ok: false, error: 'not_claude' });
+    if (this.activeRun) return reply({ ok: false, error: 'busy' });
+    const file = claudeSessionFile(this.workingDirectory, String(payload.sessionId || ''));
+    if (!file) return reply({ ok: false, error: 'not_found' });
+    let recent: ReturnType<typeof recentClaudeTurns> = [];
+    try { recent = recentClaudeTurns(file); } catch (e: any) { console.log(`[Agent] Reading the session's last turns failed: ${e?.message || e}`); }
+    this.currentSessionId = String(payload.sessionId);
+    this.hasActiveConversation = true;
+    console.log(`Resumed session ${this.currentSessionId} from ${this.workingDirectory}`);
+    reply({ ok: true, sessionId: this.currentSessionId, cwd: this.workingDirectory, recent });
   }
 
   /**
