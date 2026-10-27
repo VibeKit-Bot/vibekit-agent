@@ -18,7 +18,7 @@ npm install -g vibekit-agent
    ```bash
    npx vibekit-agent link
    ```
-   In the VibeKit app go to `Remote` and tap **Connect a computer**. The app walks the same steps as the terminal: when the terminal prints a QR code, tap **Open camera** and scan it (your iPhone camera works too); when it asks for a code, the app shows one to type. Then press Enter to start the agent right away. Can't scan? Tap **Type the code instead** and enter the code printed under the QR. For Codex, run `npx vibekit-agent link codex`.
+   In the VibeKit app tap **+** on Home, then **Connect your computer** (in app versions before 1.4.45, go to `Remote` and tap **Connect a computer**). A paired computer shows on Home and counts as one of your plan's workspaces. The app walks the same steps as the terminal: when the terminal prints a QR code, tap **Open camera** and scan it (your iPhone camera works too); when it asks for a code, the app shows one to type. Then press Enter to start the agent right away. Can't scan? Tap **Type the code instead** and enter the code printed under the QR. For Codex, run `npx vibekit-agent link codex`.
 
 2. **Older VibeKit app?** Tap **Pair an agent** in `Remote` and type the code it shows into the same terminal prompt.
 

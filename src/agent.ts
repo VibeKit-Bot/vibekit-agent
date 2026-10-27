@@ -60,6 +60,48 @@ const AGENT_VERSION: string = (() => {
 })();
 
 /**
+ * npm's global bin directory, `<prefix>/bin`, asked once per process.
+ *
+ * This used `npm bin -g`, which npm 9 removed: on any current npm it printed
+ * "Unknown command" and threw, so a global install under a prefix the fixed
+ * list below does not name was never found, and every message took the npx
+ * fallback (2026-10-25).
+ */
+let npmGlobalBinCache: string | null | undefined;
+function npmGlobalBin(): string | null {
+  if (npmGlobalBinCache !== undefined) return npmGlobalBinCache;
+  npmGlobalBinCache = null;
+  try {
+    const prefix = execSync('npm prefix -g', {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      env: { ...process.env, PATH: '/usr/local/bin:/opt/homebrew/bin:/usr/bin:' + (process.env.PATH || '') }
+    }).trim();
+    if (prefix) npmGlobalBinCache = process.platform === 'win32' ? prefix : path.join(prefix, 'bin');
+  } catch {
+    // No npm on PATH
+  }
+  return npmGlobalBinCache;
+}
+
+/**
+ * Whether npx already holds a package, so `npx --yes <pkg>` starts it from
+ * its cache instead of downloading. npx keeps each package it ran under
+ * `<npm cache>/_npx/<hash>/node_modules/<pkg>`; under `npm exec` (how the
+ * agent itself usually runs) npm passes its cache dir as npm_config_cache.
+ */
+function npxHasCached(pkg: string): boolean {
+  const cache = process.env.npm_config_cache || path.join(os.homedir(), '.npm');
+  try {
+    const root = path.join(cache, '_npx');
+    return fs.readdirSync(root).some(d =>
+      fs.existsSync(path.join(root, d, 'node_modules', pkg, 'package.json')));
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Find the claude binary by checking common installation locations
  */
 function findClaudeBinary(): string | null {
@@ -85,18 +127,10 @@ function findClaudeBinary(): string | null {
     '/Applications/Claude.app/Contents/Resources/claude',
   ];
 
-  // Try to get npm global bin directory dynamically
-  try {
-    const npmBin = execSync('npm bin -g 2>/dev/null', {
-      encoding: 'utf-8',
-      env: { ...process.env, PATH: '/usr/local/bin:/opt/homebrew/bin:/usr/bin:' + (process.env.PATH || '') }
-    }).trim();
-    if (npmBin) {
-      possiblePaths.unshift(path.join(npmBin, 'claude'));
-    }
-  } catch {
-    // Ignore
-  }
+  // Where `npm i -g` puts binaries. Matters for a Node not covered below
+  // (a standalone tarball under ~/.local, say).
+  const npmBin = npmGlobalBin();
+  if (npmBin) possiblePaths.unshift(path.join(npmBin, 'claude'));
 
   // Check nvm paths
   const nvmDir = process.env.NVM_DIR || path.join(homedir, '.nvm');
@@ -625,7 +659,7 @@ export class AgentClient {
     }, 30_000);
     const j = (await res.json().catch(() => ({}))) as any;
     if (res.status === 403) {
-      return { kind: 'stop', message: j?.error || "Your plan's computer limit is reached. Unlink a computer in the app or upgrade, then run this again." };
+      return { kind: 'stop', message: j?.error || "Your plan's workspace limit is reached (apps, chats and computers all count). Remove one in the app or upgrade, then run this again." };
     }
     if (res.status === 404 || res.status === 409) return { kind: 'renew', message: 'That pairing code is no longer valid. Here is a new one.' };
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -729,6 +763,9 @@ export class AgentClient {
       const claudePath = findClaudeBinary();
       if (claudePath) {
         console.log(`Claude Code found: ${claudePath}`);
+      } else if (npxHasCached('@anthropic-ai/claude-code')) {
+        console.log('\nClaude Code is not installed, so messages run it through `npx @anthropic-ai/claude-code` (already downloaded).');
+        console.log('Install it to start each message faster: `npm install -g @anthropic-ai/claude-code`.\n');
       } else {
         console.log('\nClaude Code not found locally — will auto-run via `npx @anthropic-ai/claude-code` on first message.');
         console.log('(First invocation downloads ~50MB and takes ~30s; cached thereafter.)');
@@ -885,9 +922,13 @@ export class AgentClient {
       command = claudeBinary;
       spawnArgs = args;
     } else {
-      console.log('Claude Code not installed locally — falling back to `npx @anthropic-ai/claude-code` (first run downloads ~50MB).');
-      // Let the user know to expect latency on first message.
-      if (this.currentChatId) {
+      const cached = npxHasCached('@anthropic-ai/claude-code');
+      console.log(`Claude Code not installed locally — falling back to \`npx @anthropic-ai/claude-code\`${cached ? ' (cached)' : ' (first run downloads ~50MB)'}.`);
+      // Warn the phone only when npx really has to download. This went out
+      // on every fallback, so a Mac with no install got "downloading it now
+      // (~30s one-time)" on every message, forever, while npx started the
+      // cached copy at once (2026-10-25).
+      if (this.currentChatId && !cached) {
         this.sendResponse(
           this.currentChatId,
           '_Claude Code isn\'t installed yet — downloading it now (~30s one-time). Subsequent messages will be instant._',
