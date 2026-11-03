@@ -25,7 +25,7 @@ import type { CodexAccess } from './config';
 import { CodexOutput, CodexTurnEnd, CodexTurnTranslator, codexPolicy } from './codex-translate';
 
 /** The newest Codex CLI this engine was checked against. Older versions still run, with a warning. */
-export const CODEX_TESTED_VERSION = '0.154.0';
+export const CODEX_TESTED_VERSION = '0.166.0';
 
 /** How long an interrupted turn gets to report `interrupted` before the app-server is killed. */
 const INTERRUPT_GRACE_MS = 5_000;

@@ -437,7 +437,6 @@ export class AgentClient {
       console.log('');
       if (engine === 'codex') {
         console.log(requestedEngine ? 'This computer will run Codex.' : 'This computer will run Codex (Claude Code was not found here).');
-        console.log('Make sure Codex is logged in on this computer: codex login');
       } else {
         console.log('Tip: connect Claude in the VibeKit app (Profile → Connect Claude)');
         console.log('and the agent signs Claude in automatically — no setup-token needed.');
@@ -468,6 +467,47 @@ export class AgentClient {
       console.log('');
       await this.start(process.cwd());
     }
+  }
+
+  /**
+   * Finds Codex and, at a terminal, offers what it lacks. Claude downloads
+   * itself and signs in from the account; Codex does neither, so without this
+   * the first message from the phone comes back "isn't installed". Asked rather
+   * than done silently: it puts global software on the computer, and a silent
+   * download would hide a broken install (docs/remote-codex-plan.md). A
+   * self-update's relaunch and pm2 have no terminal, so nothing ever waits on a
+   * question there.
+   */
+  private async setUpCodex(): Promise<void> {
+    const interactive = !!process.stdin.isTTY;
+    // A candidate only counts if `codex --version` runs, so a broken install
+    // reads as not installed instead of failing every message.
+    this.codexBinary = findCodexBinary();
+    if (!this.codexBinary && interactive
+      && await this.askYesNo('No working Codex on this computer. Install it now with `npm install -g @openai/codex`? (Y/n) ')
+      && await this.runAtTerminal('npm', ['install', '-g', '@openai/codex'])) {
+      this.codexBinary = findCodexBinary();
+    }
+    if (!this.codexBinary) return;
+    // The engine re-checks on each message, so logging in later needs no restart.
+    if (codexLoggedIn(this.codexBinary.path) !== false) return;
+    if (interactive
+      && await this.askYesNo('Codex is not signed in on this computer. Sign in now? (Y/n) ')
+      && await this.runAtTerminal(this.codexBinary.path, ['login'])) {
+      return;
+    }
+    console.log('Codex is not logged in on this computer. Run `codex login`; messages work as soon as you do.');
+  }
+
+  /** Runs a command the person can see and answer. True when it exits 0. */
+  private runAtTerminal(command: string, args: string[]): Promise<boolean> {
+    return new Promise((resolve) => {
+      // Windows' npm is a .cmd, which needs a shell. Codex is a native binary at
+      // a path that may hold spaces, which a shell would split.
+      const child = spawn(command, args, { stdio: 'inherit', shell: command === 'npm' && process.platform === 'win32' });
+      child.on('error', () => resolve(false));
+      child.on('close', (code) => resolve(code === 0));
+    });
   }
 
   /** One yes/no question at the terminal. Enter alone means yes. */
@@ -741,19 +781,11 @@ export class AgentClient {
     }
 
     if (this.engine === 'codex') {
-      // A candidate only counts if `codex --version` runs, so a broken install
-      // reads as not installed instead of failing every message.
-      this.codexBinary = findCodexBinary();
+      await this.setUpCodex();
       if (this.codexBinary) {
         console.log(`Codex found: ${this.codexBinary.path} (v${this.codexBinary.version})`);
         if (isOlderVersion(this.codexBinary.version, CODEX_TESTED_VERSION)) {
           console.log(`This Codex is older than v${CODEX_TESTED_VERSION}, the version VibeKit Remote was tested with. If messages fail, run: npm i -g @openai/codex@latest`);
-        }
-        // Said here so a user at the terminal can fix it before the first
-        // message. The engine re-checks on each message, so logging in later
-        // needs no restart.
-        if (codexLoggedIn(this.codexBinary.path) === false) {
-          console.log('Codex is not logged in on this computer. Run `codex login`; messages work as soon as you do.');
         }
       } else {
         console.log('\nCodex not found. Install it with `npm i -g @openai/codex`, then run `codex login`.');
@@ -2193,13 +2225,6 @@ export class AgentClient {
     }
 
     this.sendStatus('busy');
-
-    // Send an immediate progress signal so the iOS chat doesn't sit on a
-    // bare "thinking" indicator for 5-30s during Claude Code spawn / cold
-    // model load. The first real `assistant` text event will overwrite this
-    // (handleSSE replaces streamingText on each `text` event). Without it,
-    // a slow spawn looks identical to a hung agent.
-    this.sendStreaming(chatId, 'Starting…');
 
     // Run the engine (its events send status updates)
     if (this.engine === 'codex') {
